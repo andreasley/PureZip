@@ -325,16 +325,19 @@ enum Deflate {
             depth[node] = depth[parent[node]] + 1
         }
 
-        // Count leaves per depth, clamping any depth beyond maxBits.
+        // Count leaves per depth, clamping any depth beyond maxBits. Like
+        // zlib, overflow counts every node — internal or leaf — beyond
+        // maxBits: each stands for half a Kraft unit at maxBits, which is
+        // what makes the redistribution below restore the Kraft equality
+        // exactly. (Counting only leaves under-corrects and can emit an
+        // over-subscribed, undecodable code for very deep trees.)
         var lengthCount = [Int](repeating: 0, count: maxBits + 1)
         var overflow = 0
+        for node in 0..<nodeCount where depth[node] > maxBits {
+            overflow += 1
+        }
         for leaf in 0..<n {
-            var bits = depth[leaf]
-            if bits > maxBits {
-                bits = maxBits
-                overflow += 1
-            }
-            lengthCount[bits] += 1
+            lengthCount[min(depth[leaf], maxBits)] += 1
         }
         // Redistribute overflow leaves (zlib's algorithm): repeatedly move one
         // leaf one level down to make room at the maximum depth.

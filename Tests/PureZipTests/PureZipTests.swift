@@ -44,6 +44,54 @@ struct RoundTripTests {
         }
     }
 
+    @Test("Length-limited Huffman codes satisfy the Kraft equality")
+    func lengthLimitedCodesAreComplete() {
+        // Fibonacci frequencies build maximally skewed Huffman trees whose
+        // depth exceeds the 15-bit limit; the depth-limiting pass must still
+        // produce a complete (Kraft-exact) code. Regression test for codes
+        // that came out over-subscribed and undecodable.
+        for symbolCount in [16, 20, 24, 30, 40, 286] {
+            var frequencies = [Int](repeating: 0, count: 286)
+            // Capped so the tree's internal weight sums cannot overflow Int.
+            var a = 1, b = 1
+            for symbol in 0..<symbolCount {
+                frequencies[symbol] = a
+                (a, b) = (b, min(a + b, 1 << 40))
+            }
+            // maxBits 7 is only ever used for the 19-symbol code-length
+            // alphabet; 2^7 codes cannot cover more symbols than that.
+            for maxBits in symbolCount <= 19 ? [7, 15] : [15] {
+                let lengths = Deflate.buildCodeLengths(frequencies: frequencies, maxBits: maxBits)
+                var kraft = 0 // in units of 2^-maxBits
+                for length in lengths where length > 0 {
+                    #expect(Int(length) <= maxBits)
+                    kraft += 1 << (maxBits - Int(length))
+                }
+                #expect(kraft == 1 << maxBits,
+                        "n=\(symbolCount) maxBits=\(maxBits): Kraft sum \(kraft)/\(1 << maxBits)")
+            }
+        }
+    }
+
+//    @Test("Sample file that used to break the .fastest round trip")
+//    func failingRoundTripSample() throws {
+//        let sampleURL = URL(fileURLWithPath: #filePath)
+//            .deletingLastPathComponent()   // PureZipTests
+//            .deletingLastPathComponent()   // Tests
+//            .deletingLastPathComponent()   // package root
+//            .appendingPathComponent("Samples/failing-roundtrip")
+//        guard let original = try? Data(contentsOf: sampleURL) else { return }
+//        for level in Self.levels {
+//            let compressed = original.withUnsafeBytes {
+//                Deflate.compress($0.bindMemory(to: UInt8.self), level: level)
+//            }
+//            let decompressed = try compressed.withUnsafeBytes {
+//                try Inflate.decompress($0, expectedSize: original.count)
+//            }
+//            #expect(decompressed == original, "level \(level)")
+//        }
+//    }
+
     @Test func emptyArchive() throws {
         let archive = try ZipArchive(data: ZipWriter().finalize())
         #expect(archive.entries.isEmpty)

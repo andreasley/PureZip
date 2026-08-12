@@ -1,12 +1,26 @@
 import Foundation
 
+/// Destination for decompressed DEFLATE output.
+///
+/// Implementations expose a contiguous buffer whose trailing bytes always
+/// include at least the last 32 KiB written (DEFLATE's back-reference window),
+/// so match copies can be plain pointer arithmetic.
+protocol InflateOutput {
+    var pointer: UnsafeMutablePointer<UInt8> { get }
+    var count: Int { get set }
+    /// Guarantees room for `n` more contiguous bytes, throwing if the stream
+    /// produces more data than it declared.
+    mutating func ensure(_ n: Int) throws
+}
+
 /// A pure-Swift DEFLATE (RFC 1951) decompressor.
 ///
 /// Designed for ZIP extraction, where the expected uncompressed size is known
-/// in advance: the output buffer is hard-capped at that size, so a lying or
-/// malicious stream can never produce more data than the archive declared
-/// (and the caller checks the declared size against its security limits
-/// before calling).
+/// in advance: output is hard-capped at that size, so a lying or malicious
+/// stream can never produce more data than the archive declared (and the
+/// caller checks the declared size against its security limits before
+/// calling). Two output modes exist: a one-shot buffer sized to the entry,
+/// and a constant-memory windowed buffer that drains to a sink for streaming.
 enum Inflate {
     // MARK: - Huffman decoding table
 
@@ -74,12 +88,12 @@ enum Inflate {
     private static let fixedDistanceTable: Table =
         try! Table(codeLengths: DeflateSpec.fixedDistanceLengths[...])
 
-    // MARK: - Output buffer
+    // MARK: - One-shot output buffer
 
     /// A manually managed output buffer with a hard size cap. Grows geometrically
     /// so that a stream lying about its uncompressed size cannot force a giant
     /// upfront allocation.
-    struct OutputBuffer {
+    struct OutputBuffer: InflateOutput {
         private(set) var pointer: UnsafeMutablePointer<UInt8>
         private(set) var capacity: Int
         var count = 0
@@ -131,9 +145,59 @@ enum Inflate {
         }
     }
 
-    // MARK: - Decompression
+    // MARK: - Windowed (streaming) output buffer
 
-    /// Decompresses a raw DEFLATE stream whose uncompressed size is known.
+    /// A fixed-size output buffer that drains completed bytes to a sink while
+    /// always retaining the last 32 KiB as match history. Memory use is
+    /// constant regardless of the decompressed size.
+    struct WindowedOutputBuffer: InflateOutput {
+        /// 32 KiB of history plus room for the largest single write
+        /// (a 65,535-byte stored block).
+        static let capacity = DeflateSpec.windowSize + (1 << 16)
+
+        private(set) var pointer: UnsafeMutablePointer<UInt8>
+        var count = 0
+        private(set) var totalEmitted: UInt64 = 0
+        private let limit: UInt64
+        private let sink: (UnsafeRawBufferPointer) throws -> Void
+
+        init(limit: UInt64, sink: @escaping (UnsafeRawBufferPointer) throws -> Void) {
+            self.limit = limit
+            self.sink = sink
+            self.pointer = UnsafeMutablePointer<UInt8>.allocate(capacity: Self.capacity)
+        }
+
+        @inline(__always)
+        mutating func ensure(_ n: Int) throws {
+            if totalEmitted + UInt64(count) + UInt64(n) > limit {
+                throw ZipError.corruptedData("decompressed data exceeds declared size")
+            }
+            if count + n > Self.capacity {
+                try drain(keeping: DeflateSpec.windowSize)
+            }
+        }
+
+        /// Hands everything except the trailing `keeping` bytes to the sink.
+        mutating func drain(keeping: Int) throws {
+            guard count > keeping else { return }
+            let emitCount = count - keeping
+            try sink(UnsafeRawBufferPointer(start: pointer, count: emitCount))
+            if keeping > 0 {
+                memmove(pointer, pointer + emitCount, keeping)
+            }
+            count = keeping
+            totalEmitted += UInt64(emitCount)
+        }
+
+        mutating func destroy() {
+            pointer.deallocate()
+        }
+    }
+
+    // MARK: - Decompression entry points
+
+    /// Decompresses a raw DEFLATE stream whose uncompressed size is known,
+    /// returning the whole result in memory.
     ///
     /// - Parameters:
     ///   - input: The compressed bytes.
@@ -156,7 +220,30 @@ enum Inflate {
         return output.takeData()
     }
 
-    private static func decode(_ reader: inout BitReader, into output: inout OutputBuffer) throws {
+    /// Decompresses a raw DEFLATE stream, delivering output as sequential
+    /// chunks to `chunkHandler`. Memory use is constant (~96 KiB) regardless
+    /// of the decompressed size.
+    static func decompress(
+        _ input: UnsafeRawBufferPointer,
+        expectedSize: UInt64,
+        chunkHandler: (UnsafeRawBufferPointer) throws -> Void
+    ) throws {
+        guard !input.isEmpty else { throw ZipError.truncatedData }
+        try withoutActuallyEscaping(chunkHandler) { handler in
+            var output = WindowedOutputBuffer(limit: expectedSize, sink: handler)
+            defer { output.destroy() }
+            var reader = BitReader(input)
+            try decode(&reader, into: &output)
+            try output.drain(keeping: 0)
+            guard output.totalEmitted == expectedSize else {
+                throw ZipError.corruptedData("decompressed size does not match declared size")
+            }
+        }
+    }
+
+    private static func decode<Output: InflateOutput>(
+        _ reader: inout BitReader, into output: inout Output
+    ) throws {
         while true {
             let isFinal = try reader.take(1) == 1
             let blockType = try reader.take(2)
@@ -176,7 +263,9 @@ enum Inflate {
         }
     }
 
-    private static func copyStoredBlock(_ reader: inout BitReader, into output: inout OutputBuffer) throws {
+    private static func copyStoredBlock<Output: InflateOutput>(
+        _ reader: inout BitReader, into output: inout Output
+    ) throws {
         try reader.alignToByte()
         let length = try reader.take(16)
         let lengthComplement = try reader.take(16)
@@ -253,9 +342,9 @@ enum Inflate {
     }
 
     /// The hot loop: decodes one compressed block's literal/match stream.
-    private static func decodeBlock(
+    private static func decodeBlock<Output: InflateOutput>(
         _ reader: inout BitReader,
-        into output: inout OutputBuffer,
+        into output: inout Output,
         literals: Table,
         distances: Table
     ) throws {

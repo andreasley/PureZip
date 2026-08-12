@@ -123,6 +123,14 @@ struct BitWriter {
         }
     }
 
+    /// Removes and returns the fully written bytes, keeping any pending
+    /// partial byte in the accumulator. Used to drain streaming output.
+    mutating func takeBytes() -> [UInt8] {
+        let taken = bytes
+        bytes = []
+        return taken
+    }
+
     /// Pads with zero bits up to the next byte boundary.
     mutating func alignToByte() {
         if bitCount > 0 {

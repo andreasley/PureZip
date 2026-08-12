@@ -274,8 +274,9 @@ public struct ZipArchive: Sendable {
 
     // MARK: - Extraction
 
-    /// Decompresses a single entry into memory, verifying size and checksum.
-    public func extractData(_ entry: ZipEntry) throws -> Data {
+    /// Validates that an entry can be extracted under the configured limits
+    /// and returns its (supported) compression method.
+    private func validateExtractable(_ entry: ZipEntry) throws -> ZipCompressionMethod {
         guard !entry.isEncrypted else {
             throw ZipError.encryptedEntryUnsupported(entry.path)
         }
@@ -291,10 +292,16 @@ public struct ZipArchive: Sendable {
         guard entry.uncompressedSize <= UInt64(Int.max), entry.compressedSize <= UInt64(Int.max) else {
             throw ZipError.limitExceeded("entry '\(entry.path)' is too large for this platform")
         }
+        return method
+    }
 
-        let result: Data = try data.withUnsafeBytes { buffer in
-            // Find the start of the entry's data past its local file header.
-            // Sizes and CRC come from the central directory, which is authoritative.
+    /// Locates an entry's compressed bytes past its local file header and
+    /// passes them to `body`. Sizes and CRC come from the central directory,
+    /// which is authoritative.
+    private func withCompressedData<T>(
+        for entry: ZipEntry, _ body: (UnsafeRawBufferPointer) throws -> T
+    ) throws -> T {
+        try data.withUnsafeBytes { buffer in
             guard entry.localHeaderOffset <= UInt64(buffer.count),
                   Int(entry.localHeaderOffset) + 30 <= buffer.count else {
                 throw ZipError.truncatedData
@@ -315,10 +322,16 @@ public struct ZipArchive: Sendable {
             guard dataStart <= buffer.count, compressedSize <= buffer.count - dataStart else {
                 throw ZipError.truncatedData
             }
-            let compressed = UnsafeRawBufferPointer(
-                rebasing: buffer[dataStart..<dataStart + compressedSize]
+            return try body(
+                UnsafeRawBufferPointer(rebasing: buffer[dataStart..<dataStart + compressedSize])
             )
+        }
+    }
 
+    /// Decompresses a single entry into memory, verifying size and checksum.
+    public func extractData(_ entry: ZipEntry) throws -> Data {
+        let method = try validateExtractable(entry)
+        let result: Data = try withCompressedData(for: entry) { compressed in
             switch method {
             case .store:
                 guard entry.compressedSize == entry.uncompressedSize else {
@@ -341,6 +354,105 @@ public struct ZipArchive: Sendable {
     public func extractData(at path: String) throws -> Data {
         guard let entry = self[path] else { throw ZipError.entryNotFound(path) }
         return try extractData(entry)
+    }
+
+    /// Decompresses a single entry, delivering its contents as sequential
+    /// chunks with constant memory usage.
+    ///
+    /// The declared size and CRC-32 checksum are verified after the last
+    /// chunk; a `ZipError` thrown at the end means the already-delivered
+    /// bytes must be discarded.
+    public func extract(_ entry: ZipEntry, chunkHandler: (Data) throws -> Void) throws {
+        let method = try validateExtractable(entry)
+        var crc: UInt32 = 0
+        var total: UInt64 = 0
+        try withCompressedData(for: entry) { compressed in
+            func emit(_ chunk: UnsafeRawBufferPointer) throws {
+                guard let base = chunk.baseAddress, !chunk.isEmpty else { return }
+                crc = CRC32.checksum(chunk, seed: crc)
+                total += UInt64(chunk.count)
+                try chunkHandler(Data(bytes: base, count: chunk.count))
+            }
+
+            switch method {
+            case .store:
+                guard entry.compressedSize == entry.uncompressedSize else {
+                    throw ZipError.corruptedData("stored entry with mismatched sizes")
+                }
+                var offset = 0
+                while offset < compressed.count {
+                    let chunkSize = min(1 << 19, compressed.count - offset)
+                    try emit(UnsafeRawBufferPointer(
+                        rebasing: compressed[offset..<offset + chunkSize]
+                    ))
+                    offset += chunkSize
+                }
+            case .deflate:
+                try Inflate.decompress(
+                    compressed, expectedSize: entry.uncompressedSize, chunkHandler: emit
+                )
+            }
+        }
+        guard total == entry.uncompressedSize else {
+            throw ZipError.corruptedData("decompressed size does not match declared size")
+        }
+        guard crc == entry.crc32 else {
+            throw ZipError.checksumMismatch(entry.path)
+        }
+    }
+
+    /// Extracts a single entry to a file with constant memory usage, then
+    /// applies its permissions and modification date.
+    ///
+    /// If verification fails (checksum or size mismatch), the partially
+    /// written file is removed before the error is thrown.
+    public func extract(_ entry: ZipEntry, to fileURL: URL, overwrite: Bool = false) throws {
+        guard !entry.isSymbolicLink else {
+            throw ZipError.unsupportedFeature("symbolic link entries are not extracted")
+        }
+        if entry.isDirectory {
+            try FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: true)
+            return
+        }
+
+        let fileManager = FileManager.default
+        // Never write through an existing symlink at the target itself.
+        if let attributes = try? fileManager.attributesOfItem(atPath: fileURL.path),
+           attributes[.type] as? FileAttributeType == .typeSymbolicLink {
+            guard overwrite else { throw ZipError.destinationExists(fileURL.path) }
+            try fileManager.removeItem(at: fileURL)
+        }
+        do {
+            try Data().write(to: fileURL, options: overwrite ? [] : [.withoutOverwriting])
+        } catch let error as CocoaError where error.code == .fileWriteFileExists {
+            throw ZipError.destinationExists(fileURL.path)
+        }
+
+        let handle = try FileHandle(forWritingTo: fileURL)
+        do {
+            try extract(entry) { chunk in
+                try handle.write(contentsOf: chunk)
+            }
+            try handle.close()
+        } catch {
+            try? handle.close()
+            try? fileManager.removeItem(at: fileURL)
+            throw error
+        }
+
+        if let permissions = entry.posixPermissions {
+            // Drop set-uid/set-gid/sticky bits; keep the file owner-accessible.
+            let safePermissions = (permissions & 0o777) | 0o600
+            try? fileManager.setAttributes(
+                [.posixPermissions: NSNumber(value: safePermissions)],
+                ofItemAtPath: fileURL.path
+            )
+        }
+        if let date = entry.modificationDate {
+            try? fileManager.setAttributes(
+                [.modificationDate: date], ofItemAtPath: fileURL.path
+            )
+        }
     }
 
     /// Extracts all entries into `directory`, creating it if necessary.
@@ -391,33 +503,9 @@ public struct ZipArchive: Sendable {
                 at: target.deletingLastPathComponent(), withIntermediateDirectories: true
             )
 
-            // Never write through an existing symlink at the target itself.
-            if let attributes = try? fileManager.attributesOfItem(atPath: target.path),
-               attributes[.type] as? FileAttributeType == .typeSymbolicLink {
-                guard overwrite else { throw ZipError.destinationExists(target.path) }
-                try fileManager.removeItem(at: target)
-            }
-
-            let contents = try extractData(entry)
-            do {
-                try contents.write(to: target, options: overwrite ? [] : [.withoutOverwriting])
-            } catch let error as CocoaError where error.code == .fileWriteFileExists {
-                throw ZipError.destinationExists(target.path)
-            }
-
-            if let permissions = entry.posixPermissions {
-                // Drop set-uid/set-gid/sticky bits; keep the file owner-accessible.
-                let safePermissions = (permissions & 0o777) | 0o600
-                try? fileManager.setAttributes(
-                    [.posixPermissions: NSNumber(value: safePermissions)],
-                    ofItemAtPath: target.path
-                )
-            }
-            if let date = entry.modificationDate {
-                try? fileManager.setAttributes(
-                    [.modificationDate: date], ofItemAtPath: target.path
-                )
-            }
+            // Streams the entry to disk with constant memory usage and applies
+            // permissions and dates; also refuses to write through symlinks.
+            try extract(entry, to: target, overwrite: overwrite)
         }
     }
 }

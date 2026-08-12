@@ -7,23 +7,12 @@ import Foundation
 /// as UTF-8 with the UTF-8 flag set when they contain non-ASCII characters.
 /// ZIP64 records are written automatically when sizes, offsets, or the entry
 /// count require them.
+///
+/// For large archives or large entries, prefer `ZipFileWriter`, which streams
+/// straight to disk with constant memory usage.
 public final class ZipWriter {
-    private struct PendingCentralRecord {
-        let nameBytes: [UInt8]
-        let flags: UInt16
-        let method: UInt16
-        let dosTime: UInt16
-        let dosDate: UInt16
-        let crc32: UInt32
-        let compressedSize: UInt64
-        let uncompressedSize: UInt64
-        let localHeaderOffset: UInt64
-        let externalAttributes: UInt32
-        let isDirectory: Bool
-    }
-
     private var output: [UInt8] = []
-    private var records: [PendingCentralRecord] = []
+    private var records: [ZipEntryRecord] = []
     private var addedPaths: Set<String> = []
     private let level: CompressionLevel
 
@@ -76,8 +65,7 @@ public final class ZipWriter {
             payload: payload,
             storedData: payload == nil ? data : nil,
             modificationDate: modificationDate,
-            externalAttributes: externalAttributes,
-            isDirectory: false
+            externalAttributes: externalAttributes
         )
     }
 
@@ -101,8 +89,7 @@ public final class ZipWriter {
             payload: nil,
             storedData: nil,
             modificationDate: modificationDate,
-            externalAttributes: externalAttributes,
-            isDirectory: true
+            externalAttributes: externalAttributes
         )
     }
 
@@ -114,8 +101,7 @@ public final class ZipWriter {
         payload: [UInt8]?,
         storedData: Data?,
         modificationDate: Date,
-        externalAttributes: UInt32,
-        isDirectory: Bool
+        externalAttributes: UInt32
     ) throws {
         let nameBytes = [UInt8](normalizedPath.utf8)
         guard nameBytes.count <= 0xFFFF else { throw ZipError.invalidPath(normalizedPath) }
@@ -159,7 +145,7 @@ public final class ZipWriter {
         }
 
         records.append(
-            PendingCentralRecord(
+            ZipEntryRecord(
                 nameBytes: nameBytes,
                 flags: flags,
                 method: method,
@@ -169,8 +155,7 @@ public final class ZipWriter {
                 compressedSize: compressedSize,
                 uncompressedSize: uncompressedSize,
                 localHeaderOffset: localHeaderOffset,
-                externalAttributes: externalAttributes,
-                isDirectory: isDirectory
+                externalAttributes: externalAttributes
             )
         )
     }
@@ -181,75 +166,7 @@ public final class ZipWriter {
     /// The writer must not be used after calling this.
     public func finalize() -> Data {
         let centralDirectoryOffset = UInt64(output.count)
-
-        for record in records {
-            var zip64Fields: [UInt64] = []
-            let needsSizeFields = record.uncompressedSize >= 0xFFFF_FFFF
-                || record.compressedSize >= 0xFFFF_FFFF
-            if record.uncompressedSize >= 0xFFFF_FFFF { zip64Fields.append(record.uncompressedSize) }
-            if record.compressedSize >= 0xFFFF_FFFF { zip64Fields.append(record.compressedSize) }
-            if record.localHeaderOffset >= 0xFFFF_FFFF { zip64Fields.append(record.localHeaderOffset) }
-            let extraLength = zip64Fields.isEmpty ? 0 : 4 + 8 * zip64Fields.count
-
-            output.appendLE32(0x0201_4B50)
-            output.appendLE16((3 << 8) | 20) // made by: Unix, PKZIP 2.0
-            output.appendLE16(needsSizeFields || record.localHeaderOffset >= 0xFFFF_FFFF ? 45 : 20)
-            output.appendLE16(record.flags)
-            output.appendLE16(record.method)
-            output.appendLE16(record.dosTime)
-            output.appendLE16(record.dosDate)
-            output.appendLE32(record.crc32)
-            output.appendLE32(record.compressedSize >= 0xFFFF_FFFF ? 0xFFFF_FFFF : UInt32(record.compressedSize))
-            output.appendLE32(record.uncompressedSize >= 0xFFFF_FFFF ? 0xFFFF_FFFF : UInt32(record.uncompressedSize))
-            output.appendLE16(UInt16(record.nameBytes.count))
-            output.appendLE16(UInt16(extraLength))
-            output.appendLE16(0) // comment length
-            output.appendLE16(0) // disk number start
-            output.appendLE16(0) // internal attributes
-            output.appendLE32(record.externalAttributes)
-            output.appendLE32(record.localHeaderOffset >= 0xFFFF_FFFF ? 0xFFFF_FFFF : UInt32(record.localHeaderOffset))
-            output.append(contentsOf: record.nameBytes)
-            if !zip64Fields.isEmpty {
-                output.appendLE16(0x0001)
-                output.appendLE16(UInt16(8 * zip64Fields.count))
-                for field in zip64Fields { output.appendLE64(field) }
-            }
-        }
-
-        let centralDirectorySize = UInt64(output.count) - centralDirectoryOffset
-        let entryCount = UInt64(records.count)
-        let needsZip64End = entryCount >= 0xFFFF
-            || centralDirectorySize >= 0xFFFF_FFFF
-            || centralDirectoryOffset >= 0xFFFF_FFFF
-
-        if needsZip64End {
-            let zip64EndOffset = UInt64(output.count)
-            output.appendLE32(0x0606_4B50)
-            output.appendLE64(44) // size of the remainder of this record
-            output.appendLE16((3 << 8) | 45)
-            output.appendLE16(45)
-            output.appendLE32(0) // this disk
-            output.appendLE32(0) // central directory disk
-            output.appendLE64(entryCount)
-            output.appendLE64(entryCount)
-            output.appendLE64(centralDirectorySize)
-            output.appendLE64(centralDirectoryOffset)
-
-            output.appendLE32(0x0706_4B50) // locator
-            output.appendLE32(0)
-            output.appendLE64(zip64EndOffset)
-            output.appendLE32(1)
-        }
-
-        output.appendLE32(0x0605_4B50)
-        output.appendLE16(0)
-        output.appendLE16(0)
-        output.appendLE16(entryCount >= 0xFFFF ? 0xFFFF : UInt16(entryCount))
-        output.appendLE16(entryCount >= 0xFFFF ? 0xFFFF : UInt16(entryCount))
-        output.appendLE32(centralDirectorySize >= 0xFFFF_FFFF ? 0xFFFF_FFFF : UInt32(centralDirectorySize))
-        output.appendLE32(centralDirectoryOffset >= 0xFFFF_FFFF ? 0xFFFF_FFFF : UInt32(centralDirectoryOffset))
-        output.appendLE16(0) // comment length
-
+        output += ZipFormat.centralDirectory(records: records, startingAt: centralDirectoryOffset)
         defer {
             output = []
             records = []

@@ -28,6 +28,9 @@ public enum ZipError: Error, Equatable, CustomStringConvertible {
     case destinationExists(String)
     /// No entry with the requested path exists in the archive.
     case entryNotFound(String)
+    /// The writer is in a state that does not allow this operation
+    /// (e.g. it already failed, was finalized, or an entry is still open).
+    case invalidState(String)
 
     public var description: String {
         switch self {
@@ -57,6 +60,8 @@ public enum ZipError: Error, Equatable, CustomStringConvertible {
             return "Destination '\(path)' already exists."
         case .entryNotFound(let path):
             return "No entry named '\(path)' exists in the archive."
+        case .invalidState(let detail):
+            return "Invalid operation: \(detail)."
         }
     }
 }

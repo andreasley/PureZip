@@ -50,24 +50,20 @@ public enum PureZip {
             throw ZipError.entryNotFound(sourceURL.path)
         }
 
-        let writer = ZipWriter(level: level)
-        if isDirectory.boolValue {
-            try addDirectoryTree(at: sourceURL, to: writer)
-        } else {
-            let values = try? sourceURL.resourceValues(forKeys: [.contentModificationDateKey])
-            try writer.addFile(
-                path: sourceURL.lastPathComponent,
-                data: try Data(contentsOf: sourceURL, options: .mappedIfSafe),
-                modificationDate: values?.contentModificationDate ?? Date(),
-                permissions: posixPermissions(at: sourceURL) ?? 0o644
-            )
-        }
-
-        let archive = writer.finalize()
+        // Stream straight to disk: neither the archive nor any single entry
+        // is held in memory.
+        let writer = try ZipFileWriter(url: destinationURL, level: level, overwrite: overwrite)
         do {
-            try archive.write(to: destinationURL, options: overwrite ? [] : [.withoutOverwriting])
-        } catch let error as CocoaError where error.code == .fileWriteFileExists {
-            throw ZipError.destinationExists(destinationURL.path)
+            if isDirectory.boolValue {
+                try addDirectoryTree(at: sourceURL, to: writer)
+            } else {
+                try writer.addFile(path: sourceURL.lastPathComponent, contentsOf: sourceURL)
+            }
+            try writer.finalize()
+        } catch {
+            // Don't leave a partial archive behind.
+            try? fileManager.removeItem(at: destinationURL)
+            throw error
         }
     }
 
@@ -86,7 +82,7 @@ public enum PureZip {
 
     // MARK: - Directory traversal
 
-    private static func addDirectoryTree(at rootURL: URL, to writer: ZipWriter) throws {
+    private static func addDirectoryTree(at rootURL: URL, to writer: ZipFileWriter) throws {
         let fileManager = FileManager.default
         let root = rootURL.standardizedFileURL
         let rootName = root.lastPathComponent
@@ -127,12 +123,8 @@ public enum PureZip {
                     permissions: posixPermissions(at: url) ?? 0o755
                 )
             } else {
-                try writer.addFile(
-                    path: archivePath,
-                    data: try Data(contentsOf: url, options: .mappedIfSafe),
-                    modificationDate: values.contentModificationDate ?? Date(),
-                    permissions: posixPermissions(at: url) ?? 0o644
-                )
+                // Streams the file's contents; only a small chunk is in memory at a time.
+                try writer.addFile(path: archivePath, contentsOf: url)
             }
         }
     }

@@ -6,6 +6,7 @@ A pure-Swift ZIP library — read, write, compress, and extract ZIP archives wit
 
 - **Read and write ZIP archives**, in memory or on disk
 - **Compress files and folders** to `.zip`, extract archives to a directory
+- **Streaming compression and extraction** with constant memory usage: `ZipFileWriter` compresses entries chunk by chunk straight to disk (including push-style entries of unknown size), and `ZipArchive` extracts entries of any size through a fixed ~96 KiB window — `zipItem`/`unzipItem` use these automatically
 - **Pure Swift DEFLATE** (RFC 1951): LZ77 hash-chain matching with lazy evaluation; per-block selection between dynamic Huffman, fixed Huffman, and stored encoding, so output never balloons
 - **ZIP64 support**: large sizes/offsets and more than 65,535 entries
 - **Automatic store fallback**: entries that don't shrink under DEFLATE are stored uncompressed
@@ -40,6 +41,25 @@ try PureZip.zipItem(at: folderURL, to: archiveURL)
 try PureZip.unzipItem(at: archiveURL, to: destinationURL)
 ```
 
+### Stream an archive to disk (constant memory)
+
+```swift
+let writer = try ZipFileWriter(url: archiveURL, level: .normal)
+try writer.addDirectory(path: "backup")
+
+// Stream an existing file; only ~512 KiB is in memory at a time.
+try writer.addFile(path: "backup/huge-database.sqlite", contentsOf: databaseURL)
+
+// Push-style entry: generate contents on the fly, size unknown upfront.
+try writer.addFile(path: "backup/export.csv") { stream in
+    for row in rows {
+        try stream.write(Data(row.csvLine.utf8))
+    }
+}
+
+try writer.finalize()
+```
+
 ### Create an archive in memory
 
 ```swift
@@ -62,8 +82,14 @@ for entry in archive.entries {
 // Extract a single entry into memory (CRC-verified).
 let readme = try archive.extractData(at: "docs/readme.txt")
 
-// Extract everything to disk.
+// Extract everything to disk (streams each entry; constant memory).
 try archive.extractAll(to: destinationURL, overwrite: false)
+
+// Stream a single entry to a file, or consume it in chunks.
+try archive.extract(entry, to: fileURL)
+try archive.extract(entry) { chunk in
+    hasher.update(data: chunk)
+}
 ```
 
 ### Tighten (or relax) the security limits
@@ -89,18 +115,18 @@ Measured on Apple Silicon (release build, 16 MiB payloads, `.normal` level):
 
 | Payload | Compress | Ratio | Decompress |
 |---------|----------|-------|------------|
-| Mixed text/binary | ~134 MB/s | 24% | ~435 MB/s |
-| Random (incompressible) | ~34 MB/s | stored | >10 GB/s |
-| Zero runs | ~1.0 GB/s | 0.1% | ~12 GB/s |
+| Mixed text/binary | ~120 MB/s | 24% | ~460 MB/s |
+| Random (incompressible) | ~32 MB/s | stored | >8 GB/s |
+| Zero runs | ~900 MB/s | 0.1% | ~12 GB/s |
 
 Run the suite yourself with `swift test -c release` (the `Performance` suite prints throughput).
 
 ## Drawbacks and limitations
 
-- **In-memory archive building** — `ZipWriter` assembles the whole archive in RAM, and each entry's contents are loaded fully to compress them. Fine for typical documents and app bundles; not suited to multi-gigabyte trees on memory-constrained devices.
+- **Reading maps the whole archive** — `ZipArchive` works on a (memory-mapped) `Data` of the archive; extraction output streams with constant memory, but the compressed input must be a seekable file or fit in memory. Streamed *writing* has no such constraint.
+- **Streamed entries always use DEFLATE** — the store-vs-deflate size comparison only happens for in-memory `addFile(path:data:)`; streamed entries can't be retroactively stored (though incompressible data degrades gracefully to stored blocks inside the DEFLATE stream, costing only ~0.01%). Pass `compress: false` to store explicitly.
 - **No encryption** — neither legacy ZipCrypto nor AES; encrypted entries are rejected, never silently skipped.
 - **DEFLATE and Store only** — archives using bzip2, LZMA, Zstandard, etc. are refused with `.unsupportedCompressionMethod`.
-- **No streaming API** — entries are compressed/decompressed as whole buffers; there is no incremental read/write interface yet.
 - **Symbolic links are skipped** on both compression and extraction (a deliberate security trade-off, but it means link-heavy trees don't round-trip).
 - **No multi-disk (spanned) archives**, and self-extracting archives with data prepended before the ZIP structure are not recognized.
 - **No archive editing** — an existing archive can't be appended to or repacked in place; build a new one instead.
@@ -108,7 +134,7 @@ Run the suite yourself with `swift test -c release` (the `Performance` suite pri
 
 ## Possible future features
 
-- Streaming compression/extraction (constant-memory `ZipWriter` that writes straight to disk, chunked entry readers)
+- Streaming *input* for reading: open archives from a file handle without mapping, for pipes and network streams
 - AES-256 encryption and decryption (and read-only ZipCrypto support)
 - Appending to and updating existing archives
 - Optional symlink round-tripping behind an explicit opt-in flag
@@ -121,11 +147,12 @@ Run the suite yourself with `swift test -c release` (the `Performance` suite pri
 ## Requirements
 
 - Swift 6.3+ (uses the `Testing` framework for tests)
+- macOS 12+, iOS 15+, tvOS 15+, watchOS 8+, or visionOS 1+
 - Foundation (used for `Data`, `URL`, and file-system operations)
 
 ## Testing
 
-74 test cases cover round trips across sizes, levels, and content types; tricky filenames (emoji, CJK, combining accents, CP437, very long names); real-world fixtures created by Info-ZIP and zlib; verification of generated archives with the system `unzip`; and the full attack surface: traversal payloads, symlinks, ZIP bombs, lying size headers, flipped bytes, truncation, and garbage input.
+86 test cases cover round trips across sizes, levels, and content types; streaming compression and extraction (chunked writes, cross-chunk matches, window sliding, partial-file cleanup); tricky filenames (emoji, CJK, combining accents, CP437, very long names); real-world fixtures created by Info-ZIP and zlib; verification of generated archives with the system `unzip`; and the full attack surface: traversal payloads, symlinks, ZIP bombs, lying size headers, flipped bytes, truncation, and garbage input.
 
 ```sh
 swift test              # fast, debug

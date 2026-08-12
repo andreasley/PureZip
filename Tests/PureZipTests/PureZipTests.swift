@@ -1,8 +1,535 @@
+import Foundation
 import Testing
 @testable import PureZip
 
-@Test func example() async throws {
-    // Write your test here and use APIs like `#expect(...)` to check expected conditions.
-    // Swift Testing Documentation
-    // https://developer.apple.com/documentation/testing
+// MARK: - Round trips
+
+@Suite("Compression round trips")
+struct RoundTripTests {
+    @Test func crc32KnownVector() {
+        #expect(CRC32.checksum([UInt8]("123456789".utf8)) == 0xCBF4_3926)
+        #expect(CRC32.checksum([]) == 0)
+    }
+
+    static let payloadSizes = [0, 1, 2, 3, 100, 4096, 65535, 65536, 65537, 200_000]
+    static let levels: [CompressionLevel] = [.fastest, .normal, .maximum]
+
+    @Test("Deflate/Inflate round trip", arguments: payloadSizes, levels)
+    func deflateRoundTrip(size: Int, level: CompressionLevel) throws {
+        for original in [mixedData(count: size, seed: UInt64(size + 1)),
+                         randomData(count: size, seed: UInt64(size + 7))] {
+            let compressed = original.withUnsafeBytes {
+                Deflate.compress($0.bindMemory(to: UInt8.self), level: level)
+            }
+            let decompressed = try compressed.withUnsafeBytes {
+                try Inflate.decompress($0, expectedSize: original.count)
+            }
+            #expect(decompressed == original)
+        }
+    }
+
+    @Test("Highly repetitive data round trip")
+    func repetitiveData() throws {
+        for original in [Data(count: 1 << 20),                          // all zeros
+                         Data(repeating: 0xAB, count: 300_000),
+                         Data((0..<300_000).map { UInt8($0 % 256) })] { // cycling bytes
+            let compressed = original.withUnsafeBytes {
+                Deflate.compress($0.bindMemory(to: UInt8.self), level: .normal)
+            }
+            #expect(compressed.count < original.count / 50, "run-length data should compress heavily")
+            let decompressed = try compressed.withUnsafeBytes {
+                try Inflate.decompress($0, expectedSize: original.count)
+            }
+            #expect(decompressed == original)
+        }
+    }
+
+    @Test func emptyArchive() throws {
+        let archive = try ZipArchive(data: ZipWriter().finalize())
+        #expect(archive.entries.isEmpty)
+    }
+
+    @Test func archiveRoundTripWithMixedEntries() throws {
+        let writer = ZipWriter()
+        let text = Data("Hello, PureZip! 🗜️ ".utf8) + Data(repeating: 0x2E, count: 5000)
+        let noise = randomData(count: 100_000, seed: 42)
+        try writer.addDirectory(path: "docs")
+        try writer.addFile(path: "docs/readme.txt", data: text)
+        try writer.addFile(path: "noise.bin", data: noise)
+        try writer.addFile(path: "empty.dat", data: Data())
+        let archiveData = writer.finalize()
+
+        let archive = try ZipArchive(data: archiveData)
+        #expect(archive.entries.count == 4)
+
+        let readme = try #require(archive["docs/readme.txt"])
+        #expect(readme.compressionMethod == .deflate)
+        #expect(readme.compressedSize < readme.uncompressedSize, "text should compress")
+        #expect(try archive.extractData(readme) == text)
+
+        let noiseEntry = try #require(archive["noise.bin"])
+        #expect(noiseEntry.compressionMethod == .store, "incompressible data should be stored")
+        #expect(try archive.extractData(noiseEntry) == noise)
+
+        #expect(try archive.extractData(at: "empty.dat") == Data())
+        #expect(try #require(archive["docs/"]).isDirectory)
+
+        #expect(throws: ZipError.entryNotFound("missing.txt")) {
+            try archive.extractData(at: "missing.txt")
+        }
+    }
+
+    @Test func storeWithoutCompression() throws {
+        let writer = ZipWriter()
+        let payload = Data("compressible compressible compressible".utf8)
+        try writer.addFile(path: "stored.txt", data: payload, compress: false)
+        let archive = try ZipArchive(data: writer.finalize())
+        let entry = try #require(archive["stored.txt"])
+        #expect(entry.compressionMethod == .store)
+        #expect(entry.compressedSize == entry.uncompressedSize)
+        #expect(try archive.extractData(entry) == payload)
+    }
+
+    @Test func metadataRoundTrip() throws {
+        let writer = ZipWriter()
+        let date = Date(timeIntervalSinceNow: -100_000)
+        try writer.addFile(path: "script.sh", data: Data("#!/bin/sh\n".utf8),
+                           modificationDate: date, permissions: 0o755)
+        let archive = try ZipArchive(data: writer.finalize())
+        let entry = try #require(archive["script.sh"])
+        #expect(entry.posixPermissions == 0o755)
+        let restored = try #require(entry.modificationDate)
+        #expect(abs(restored.timeIntervalSince(date)) <= 2, "DOS timestamps have 2s resolution")
+    }
+
+    @Test func duplicateAndInvalidWriterPaths() throws {
+        let writer = ZipWriter()
+        try writer.addFile(path: "a.txt", data: Data([1]))
+        #expect(throws: ZipError.duplicateEntry("a.txt")) {
+            try writer.addFile(path: "a.txt", data: Data([2]))
+        }
+        #expect(throws: ZipError.self) { try writer.addFile(path: "", data: Data()) }
+        #expect(throws: ZipError.self) { try writer.addFile(path: "../escape.txt", data: Data()) }
+        #expect(throws: ZipError.self) { try writer.addFile(path: "a/../../escape.txt", data: Data()) }
+    }
+
+    @Test func zip64EntryCountRoundTrip() throws {
+        // More than 0xFFFF entries forces ZIP64 end-of-central-directory records.
+        let writer = ZipWriter()
+        let date = Date()
+        for i in 0..<66_000 {
+            try writer.addFile(path: "f\(i).txt", data: Data(), modificationDate: date)
+        }
+        let archive = try ZipArchive(data: writer.finalize())
+        #expect(archive.entries.count == 66_000)
+        #expect(try archive.extractData(at: "f0.txt") == Data())
+        #expect(try archive.extractData(at: "f65999.txt") == Data())
+    }
+}
+
+// MARK: - Filenames
+
+@Suite("Filename handling")
+struct FilenameTests {
+    static let trickyNames = [
+        "héllo wörld.txt",
+        "日本語ファイル名.txt",
+        "emoji 😀🎉.bin",
+        "spaces  double  and.trailing dot.",
+        "quotes '\" backtick `.txt",
+        "plus+equals=&ampersand.txt",
+        "Ünïcödé/ñested/ß.txt",
+        "combining e\u{301} accent.txt",
+        String(repeating: "z", count: 200) + ".txt",
+    ]
+
+    @Test("Tricky names survive a round trip", arguments: trickyNames)
+    func trickyNameRoundTrip(name: String) throws {
+        let writer = ZipWriter()
+        let payload = Data("content of \(name)".utf8)
+        try writer.addFile(path: name, data: payload)
+        let archive = try ZipArchive(data: writer.finalize())
+        let entry = try #require(archive[name], "entry should be findable under its exact name")
+        #expect(entry.path == name)
+        #expect(try archive.extractData(entry) == payload)
+    }
+
+    @Test func cp437FallbackForNonUTF8Names() throws {
+        // 0x82 is "é" in CP437 and is invalid as standalone UTF-8.
+        let data = buildRawZip([.stored(nameBytes: [0x82, 0x2E, 0x74, 0x78, 0x74], content: [1, 2, 3])])
+        let archive = try ZipArchive(data: data)
+        #expect(archive.entries.first?.path == "é.txt")
+    }
+
+    @Test func unflaggedUTF8NamesAreDecodedAsUTF8() throws {
+        // Many archivers write UTF-8 names without setting the UTF-8 flag.
+        let data = buildRawZip([.stored(nameBytes: [UInt8]("ünflagged.txt".utf8), content: [7])])
+        let archive = try ZipArchive(data: data)
+        #expect(archive.entries.first?.path == "ünflagged.txt")
+    }
+
+    @Test func backslashSeparatorsAreTreatedAsPathSeparators() throws {
+        let data = buildRawZip([.stored(name: "dir\\sub\\file.txt", content: [UInt8]("x".utf8))])
+        let archive = try ZipArchive(data: data)
+        try withTemporaryDirectory { directory in
+            try archive.extractAll(to: directory)
+            let extracted = directory.appendingPathComponent("dir/sub/file.txt")
+            #expect(FileManager.default.fileExists(atPath: extracted.path))
+        }
+    }
+}
+
+// MARK: - Security
+
+@Suite("Security hardening")
+struct SecurityTests {
+    @Test("Path traversal attempts are rejected",
+          arguments: ["../evil.txt", "a/../../evil.txt", "..", "C:\\evil.txt", "..\\evil.txt"])
+    func pathTraversalRejected(maliciousPath: String) throws {
+        let data = buildRawZip([.stored(name: maliciousPath, content: [UInt8]("pwned".utf8))])
+        let archive = try ZipArchive(data: data)
+        try withTemporaryDirectory { directory in
+            let destination = directory.appendingPathComponent("dest", isDirectory: true)
+            #expect(throws: ZipError.unsafePath(maliciousPath)) {
+                try archive.extractAll(to: destination)
+            }
+            // Nothing may have escaped into the parent directory.
+            let escaped = directory.appendingPathComponent("evil.txt")
+            #expect(!FileManager.default.fileExists(atPath: escaped.path))
+        }
+    }
+
+    @Test func absolutePathsAreExtractedInsideDestination() throws {
+        let data = buildRawZip([.stored(name: "/abs.txt", content: [UInt8]("safe".utf8))])
+        let archive = try ZipArchive(data: data)
+        try withTemporaryDirectory { directory in
+            try archive.extractAll(to: directory)
+            let inside = directory.appendingPathComponent("abs.txt")
+            #expect(try Data(contentsOf: inside) == Data("safe".utf8))
+            #expect(!FileManager.default.fileExists(atPath: "/abs.txt"))
+        }
+    }
+
+    @Test func symlinkEntriesAreNeverExtracted() throws {
+        var link = RawZipEntry.stored(name: "innocent", content: [UInt8]("/etc/passwd".utf8))
+        link.externalAttributes = 0o120777 << 16 // S_IFLNK
+        let archive = try ZipArchive(data: buildRawZip([link]))
+        #expect(archive.entries.first?.isSymbolicLink == true)
+        try withTemporaryDirectory { directory in
+            try archive.extractAll(to: directory)
+            let target = directory.appendingPathComponent("innocent")
+            // Neither a symlink nor a file may exist.
+            #expect((try? FileManager.default.attributesOfItem(atPath: target.path)) == nil)
+        }
+    }
+
+    @Test func encryptedEntriesAreRejected() throws {
+        var entry = RawZipEntry.stored(name: "secret.txt", content: [1, 2, 3])
+        entry.flags |= 0x0001
+        let archive = try ZipArchive(data: buildRawZip([entry]))
+        #expect(throws: ZipError.encryptedEntryUnsupported("secret.txt")) {
+            _ = try archive.extractData(archive.entries[0])
+        }
+    }
+
+    @Test func zipBombTotalSizeLimit() throws {
+        // Three highly compressible entries; the total exceeds the configured cap.
+        let writer = ZipWriter()
+        for i in 0..<3 {
+            try writer.addFile(path: "zeros\(i).bin", data: Data(count: 600_000))
+        }
+        let data = writer.finalize()
+        #expect(data.count < 20_000, "the bomb itself must be small")
+
+        let limits = ZipSecurityLimits(maxTotalUncompressedSize: 1_000_000)
+        let archive = try ZipArchive(data: data, limits: limits)
+        try withTemporaryDirectory { directory in
+            #expect(throws: ZipError.self) {
+                try archive.extractAll(to: directory)
+            }
+        }
+    }
+
+    @Test func zipBombPerEntryLimit() throws {
+        let writer = ZipWriter()
+        try writer.addFile(path: "zeros.bin", data: Data(count: 600_000))
+        let limits = ZipSecurityLimits(maxUncompressedEntrySize: 100_000)
+        let archive = try ZipArchive(data: writer.finalize(), limits: limits)
+        #expect(throws: ZipError.self) {
+            _ = try archive.extractData(archive.entries[0])
+        }
+    }
+
+    @Test func entryCountLimit() throws {
+        let data = buildRawZip([
+            .stored(name: "a", content: []),
+            .stored(name: "b", content: []),
+            .stored(name: "c", content: []),
+        ])
+        #expect(throws: ZipError.self) {
+            _ = try ZipArchive(data: data, limits: ZipSecurityLimits(maxEntryCount: 2))
+        }
+    }
+
+    @Test func entryLyingAboutSmallSizeIsRejected() throws {
+        // The deflate stream really inflates to 200,000 bytes; the header claims 10.
+        // Decompression must stop at the declared size instead of ballooning.
+        let zeros = Data(count: 200_000)
+        var liar = RawZipEntry(name: "liar.bin")
+        liar.method = 8
+        liar.compressedData = Deflate.compress(zeros)
+        liar.uncompressedSize = 10
+        liar.crc = CRC32.checksum(zeros)
+        let archive = try ZipArchive(data: buildRawZip([liar]))
+        #expect(throws: ZipError.self) {
+            _ = try archive.extractData(archive.entries[0])
+        }
+    }
+
+    @Test func entryLyingAboutLargeSizeIsRejected() throws {
+        let zeros = Data(count: 200_000)
+        var liar = RawZipEntry(name: "liar.bin")
+        liar.method = 8
+        liar.compressedData = Deflate.compress(zeros)
+        liar.uncompressedSize = 300_000
+        liar.crc = CRC32.checksum(zeros)
+        let archive = try ZipArchive(data: buildRawZip([liar]))
+        #expect(throws: ZipError.self) {
+            _ = try archive.extractData(archive.entries[0])
+        }
+    }
+
+    @Test func corruptedChecksumIsDetected() throws {
+        let payload = Data("important payload".utf8)
+        var entry = RawZipEntry.stored(name: "f.bin", content: [UInt8](payload))
+        entry.crc &+= 1
+        let archive = try ZipArchive(data: buildRawZip([entry]))
+        #expect(throws: ZipError.checksumMismatch("f.bin")) {
+            _ = try archive.extractData(archive.entries[0])
+        }
+    }
+
+    @Test func truncatedArchivesFailCleanly() throws {
+        let writer = ZipWriter()
+        try writer.addFile(path: "a.txt", data: mixedData(count: 50_000, seed: 3))
+        let data = writer.finalize()
+        for fraction in [0.02, 0.3, 0.6, 0.95, 0.999] {
+            let cut = Data(data.prefix(Int(Double(data.count) * fraction)))
+            #expect(throws: ZipError.self) { _ = try ZipArchive(data: cut) }
+        }
+    }
+
+    @Test func flippedCompressedByteIsDetected() throws {
+        let writer = ZipWriter()
+        try writer.addFile(path: "a.bin", data: mixedData(count: 50_000, seed: 9))
+        var data = writer.finalize()
+        // Flip a byte in the middle of the compressed stream (past the ~50-byte header).
+        data[200] ^= 0xFF
+        do {
+            let archive = try ZipArchive(data: data)
+            _ = try archive.extractData(archive.entries[0])
+            Issue.record("corruption was not detected")
+        } catch is ZipError {
+            // expected: either a decode error or a checksum mismatch
+        }
+    }
+
+    @Test func garbageInputIsRejected() {
+        #expect(throws: ZipError.notAZipFile) { _ = try ZipArchive(data: Data()) }
+        #expect(throws: ZipError.notAZipFile) { _ = try ZipArchive(data: Data("not a zip".utf8)) }
+        #expect(throws: ZipError.notAZipFile) {
+            _ = try ZipArchive(data: randomData(count: 4096, seed: 11))
+        }
+    }
+
+    @Test func unsupportedCompressionMethodIsReported() throws {
+        var entry = RawZipEntry.stored(name: "x", content: [1])
+        entry.method = 12 // bzip2 — not supported
+        let archive = try ZipArchive(data: buildRawZip([entry]))
+        #expect(throws: ZipError.unsupportedCompressionMethod(12)) {
+            _ = try archive.extractData(archive.entries[0])
+        }
+    }
+}
+
+// MARK: - File and folder operations
+
+@Suite("File and folder operations")
+struct FileSystemTests {
+    @Test func folderRoundTrip() throws {
+        try withTemporaryDirectory { directory in
+            let fileManager = FileManager.default
+            let source = directory.appendingPathComponent("Source Földer", isDirectory: true)
+            try fileManager.createDirectory(
+                at: source.appendingPathComponent("nested/deep"), withIntermediateDirectories: true
+            )
+            try fileManager.createDirectory(
+                at: source.appendingPathComponent("empty dir"), withIntermediateDirectories: true
+            )
+            let textFile = source.appendingPathComponent("Notes älpha.txt")
+            try Data("Hello from PureZip".utf8).write(to: textFile)
+            let binary = mixedData(count: 150_000, seed: 21)
+            try binary.write(to: source.appendingPathComponent("nested/deep/data.bin"))
+            let script = source.appendingPathComponent("run.sh")
+            try Data("#!/bin/sh\necho hi\n".utf8).write(to: script)
+            try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
+            try Data().write(to: source.appendingPathComponent("empty.bin"))
+            // A symlink that must not end up in the archive.
+            try fileManager.createSymbolicLink(
+                at: source.appendingPathComponent("link"),
+                withDestinationURL: URL(fileURLWithPath: "/etc/hosts")
+            )
+
+            let archiveURL = directory.appendingPathComponent("out.zip")
+            try PureZip.zipItem(at: source, to: archiveURL)
+
+            let archive = try ZipArchive(url: archiveURL)
+            #expect(archive["Source Földer/link"] == nil, "symlinks must be skipped")
+
+            let destination = directory.appendingPathComponent("extracted", isDirectory: true)
+            try PureZip.unzipItem(at: archiveURL, to: destination)
+
+            let extractedRoot = destination.appendingPathComponent("Source Földer")
+            #expect(
+                try Data(contentsOf: extractedRoot.appendingPathComponent("Notes älpha.txt"))
+                    == Data("Hello from PureZip".utf8)
+            )
+            #expect(
+                try Data(contentsOf: extractedRoot.appendingPathComponent("nested/deep/data.bin"))
+                    == binary
+            )
+            #expect(
+                try Data(contentsOf: extractedRoot.appendingPathComponent("empty.bin")) == Data()
+            )
+            var isDirectory: ObjCBool = false
+            #expect(fileManager.fileExists(
+                atPath: extractedRoot.appendingPathComponent("empty dir").path,
+                isDirectory: &isDirectory
+            ))
+            #expect(isDirectory.boolValue)
+
+            let scriptAttributes = try fileManager.attributesOfItem(
+                atPath: extractedRoot.appendingPathComponent("run.sh").path
+            )
+            let permissions = (scriptAttributes[.posixPermissions] as? NSNumber)?.uint16Value ?? 0
+            #expect(permissions & 0o777 == 0o755, "executable bit should survive")
+
+            #expect(!fileManager.fileExists(atPath: extractedRoot.appendingPathComponent("link").path))
+        }
+    }
+
+    @Test func singleFileZipItem() throws {
+        try withTemporaryDirectory { directory in
+            let file = directory.appendingPathComponent("solo.txt")
+            try Data("just one file".utf8).write(to: file)
+            let archiveURL = directory.appendingPathComponent("solo.zip")
+            try PureZip.zipItem(at: file, to: archiveURL)
+            let archive = try ZipArchive(url: archiveURL)
+            #expect(archive.entries.map(\.path) == ["solo.txt"])
+            #expect(try archive.extractData(at: "solo.txt") == Data("just one file".utf8))
+        }
+    }
+
+    @Test func overwriteBehavior() throws {
+        try withTemporaryDirectory { directory in
+            let writer = ZipWriter()
+            try writer.addFile(path: "f.txt", data: Data("v1".utf8))
+            let archive = try ZipArchive(data: writer.finalize())
+            try archive.extractAll(to: directory)
+            #expect(throws: ZipError.self) { try archive.extractAll(to: directory) }
+            try archive.extractAll(to: directory, overwrite: true)
+            #expect(try Data(contentsOf: directory.appendingPathComponent("f.txt")) == Data("v1".utf8))
+        }
+    }
+}
+
+// MARK: - Interoperability with other ZIP implementations
+
+@Suite("Interoperability")
+struct InteropTests {
+    /// A small archive created by Info-ZIP 3.0 (`zip -r`) on macOS containing
+    /// stored entries with accented, Japanese, and emoji filenames plus empty
+    /// file and directory entries.
+    static let infoZipFixtureBase64 = """
+        UEsDBAoAAAAAAFyFDF3QB6l9EwAAABMAAAARAAAAaMOpbGxvIHfDtnJsZC50eHRHcsO8w59lIGF1cyBaw7xyaWNoUEsDBAoAAAAAAFyFDF0AAAAAAAAAAAAAAAAJAAAAw5ZyZG7DqXIvUEsDBAoAAAAAAFyFDF3nG4S4DwAAAA8AAAAiAAAAw5ZyZG7DqXIv5pel5pys6Kqe44OV44Kh44Kk44OrLnR4dOOBk+OCk+OBq+OBoeOBr1BLAwQKAAAAAABchQxdAAAAAAAAAAAAAAAAEAAAAMOWcmRuw6lyL25lc3RlZC9QSwMECgAAAAAAXIUMXeBOlYkFAAAABQAAAB4AAADDlnJkbsOpci9uZXN0ZWQvZW1vamkg8J+YgC50eHRwYXJ0eVBLAwQKAAAAAABchQxdAAAAAAAAAAAAAAAACQAAAGVtcHR5LmJpblBLAwQKAAAAAABchQxdAAAAAAAAAAAAAAAACgAAAGVtcHR5IGRpci9QSwECHgMKAAAAAABchQxd0AepfRMAAAATAAAAEQAAAAAAAAABAAAApIEAAAAAaMOpbGxvIHfDtnJsZC50eHRQSwECHgMKAAAAAABchQxdAAAAAAAAAAAAAAAACQAAAAAAAAAAABAA7UFCAAAAw5ZyZG7DqXIvUEsBAh4DCgAAAAAAXIUMXecbhLgPAAAADwAAACIAAAAAAAAAAQAAAKSBaQAAAMOWcmRuw6lyL+aXpeacrOiqnuODleOCoeOCpOODqy50eHRQSwECHgMKAAAAAABchQxdAAAAAAAAAAAAAAAAEAAAAAAAAAAAABAA7UG4AAAAw5ZyZG7DqXIvbmVzdGVkL1BLAQIeAwoAAAAAAFyFDF3gTpWJBQAAAAUAAAAeAAAAAAAAAAEAAACkgeYAAADDlnJkbsOpci9uZXN0ZWQvZW1vamkg8J+YgC50eHRQSwECHgMKAAAAAABchQxdAAAAAAAAAAAAAAAACQAAAAAAAAAAAAAApIEnAQAAZW1wdHkuYmluUEsBAh4DCgAAAAAAXIUMXQAAAAAAAAAAAAAAAAoAAAAAAAAAAAAQAO1BTgEAAGVtcHR5IGRpci9QSwUGAAAAAAcABwC/AQAAdgEAAAAA
+        """
+
+    /// An archive created by Info-ZIP (`zip -9`) whose single entry is a
+    /// real zlib-generated DEFLATE stream (9000 bytes of repeated text).
+    static let deflatedFixtureBase64 = """
+        UEsDBBQAAgAIAGeFDF1pL4uTWQAAACgjAAAMAAAAZGVmbGF0ZWQudHh07crLEYIwFADAVl4FVJMGQIN/A9GoUL20wcyed9M5x9wuh1sMtXyfMZZfXNtjekX55Brvje/9usSxnLpIsizLsizLsizLsizLsizLsizLsizLsizLsrzP/AdQSwECHgMUAAIACABnhQxdaS+Lk1kAAAAoIwAADAAAAAAAAAABAAAApIEAAAAAZGVmbGF0ZWQudHh0UEsFBgAAAAABAAEAOgAAAIMAAAAAAA==
+        """
+
+    @Test func readsInfoZipArchive() throws {
+        let data = try #require(Data(base64Encoded: Self.infoZipFixtureBase64))
+        let archive = try ZipArchive(data: data)
+        let paths = Set(archive.entries.map(\.path))
+        #expect(paths.contains("héllo wörld.txt"))
+        #expect(paths.contains("Ördnér/日本語ファイル.txt"))
+        #expect(paths.contains("Ördnér/nested/emoji 😀.txt"))
+        #expect(paths.contains("empty.bin"))
+        #expect(try #require(archive["empty dir/"]).isDirectory)
+
+        #expect(try archive.extractData(at: "héllo wörld.txt") == Data("Grüße aus Zürich".utf8))
+        #expect(try archive.extractData(at: "Ördnér/日本語ファイル.txt") == Data("こんにちは".utf8))
+        #expect(try archive.extractData(at: "Ördnér/nested/emoji 😀.txt") == Data("party".utf8))
+
+        try withTemporaryDirectory { directory in
+            try archive.extractAll(to: directory)
+            let file = directory.appendingPathComponent("Ördnér/nested/emoji 😀.txt")
+            #expect(try Data(contentsOf: file) == Data("party".utf8))
+        }
+    }
+
+    @Test func decompressesZlibProducedDeflateStream() throws {
+        let data = try #require(Data(base64Encoded: Self.deflatedFixtureBase64))
+        let archive = try ZipArchive(data: data)
+        let entry = try #require(archive["deflated.txt"])
+        #expect(entry.compressionMethod == .deflate)
+        let expected = Data(String(repeating: "The quick brown fox jumps over the lazy dog. ", count: 200).utf8)
+        #expect(try archive.extractData(entry) == expected)
+    }
+
+    #if os(macOS)
+    @Test func systemUnzipAcceptsOurArchives() throws {
+        let unzipPath = "/usr/bin/unzip"
+        guard FileManager.default.isExecutableFile(atPath: unzipPath) else { return }
+
+        try withTemporaryDirectory { directory in
+            let writer = ZipWriter()
+            let text = Data(String(repeating: "interop test data ", count: 3000).utf8)
+            let noise = randomData(count: 80_000, seed: 77)
+            try writer.addDirectory(path: "sub")
+            try writer.addFile(path: "sub/tëxt fïle.txt", data: text)
+            try writer.addFile(path: "noise.bin", data: noise)
+            let archiveURL = directory.appendingPathComponent("ours.zip")
+            try writer.finalize().write(to: archiveURL)
+
+            // `unzip -t` decompresses everything and verifies all CRCs.
+            let test = Process()
+            test.executableURL = URL(fileURLWithPath: unzipPath)
+            test.arguments = ["-t", archiveURL.path]
+            test.standardOutput = Pipe()
+            test.standardError = Pipe()
+            try test.run()
+            test.waitUntilExit()
+            #expect(test.terminationStatus == 0, "unzip -t should verify our archive")
+
+            // Extract with unzip and compare contents byte for byte.
+            let extractDirectory = directory.appendingPathComponent("unzip-out", isDirectory: true)
+            let extract = Process()
+            extract.executableURL = URL(fileURLWithPath: unzipPath)
+            extract.arguments = ["-q", archiveURL.path, "-d", extractDirectory.path]
+            try extract.run()
+            extract.waitUntilExit()
+            #expect(extract.terminationStatus == 0)
+            #expect(
+                try Data(contentsOf: extractDirectory.appendingPathComponent("sub/tëxt fïle.txt")) == text
+            )
+            #expect(
+                try Data(contentsOf: extractDirectory.appendingPathComponent("noise.bin")) == noise
+            )
+        }
+    }
+    #endif
 }

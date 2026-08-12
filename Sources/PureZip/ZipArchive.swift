@@ -404,9 +404,34 @@ public struct ZipArchive: Sendable {
     /// Extracts a single entry to a file with constant memory usage, then
     /// applies its permissions and modification date.
     ///
-    /// If verification fails (checksum or size mismatch), the partially
-    /// written file is removed before the error is thrown.
-    public func extract(_ entry: ZipEntry, to fileURL: URL, overwrite: Bool = false) throws {
+    /// Runs off the caller's actor; cancelling the surrounding task stops the
+    /// extraction with `CancellationError`. If verification fails (checksum or
+    /// size mismatch) or the task is cancelled, the partially written file is
+    /// removed before the error is thrown.
+    ///
+    /// - Parameter progress: Called with a snapshot after each decompressed chunk.
+    @concurrent
+    public func extract(
+        _ entry: ZipEntry,
+        to fileURL: URL,
+        overwrite: Bool = false,
+        progress: ZipProgressHandler? = nil
+    ) async throws {
+        try extractEntry(
+            entry, to: fileURL, overwrite: overwrite,
+            completedBase: 0,
+            totalBytes: entry.isDirectory ? 0 : entry.uncompressedSize,
+            progress: progress
+        )
+    }
+
+    /// Synchronous core of file extraction. `completedBase`/`totalBytes` let
+    /// `extractAll` report accumulated progress across entries.
+    private func extractEntry(
+        _ entry: ZipEntry, to fileURL: URL, overwrite: Bool,
+        completedBase: UInt64, totalBytes: UInt64,
+        progress: ZipProgressHandler?
+    ) throws {
         guard !entry.isSymbolicLink else {
             throw ZipError.unsupportedFeature("symbolic link entries are not extracted")
         }
@@ -430,8 +455,14 @@ public struct ZipArchive: Sendable {
 
         let handle = try FileHandle(forWritingTo: fileURL)
         do {
+            var completedBytes = completedBase
             try extract(entry) { chunk in
+                try Task.checkCancellation()
                 try handle.write(contentsOf: chunk)
+                completedBytes += UInt64(chunk.count)
+                progress?(ZipProgress(
+                    completedBytes: completedBytes, totalBytes: totalBytes, currentPath: entry.path
+                ))
             }
             try handle.close()
         } catch {
@@ -457,19 +488,40 @@ public struct ZipArchive: Sendable {
 
     /// Extracts all entries into `directory`, creating it if necessary.
     ///
+    /// Runs off the caller's actor; cancelling the surrounding task stops the
+    /// extraction with `CancellationError` (already-extracted files remain).
+    ///
     /// Security behavior:
     /// - Entry paths are sanitized; paths with `..` components throw `ZipError.unsafePath`.
     /// - Symbolic link entries are skipped, never created.
     /// - Files are never written through a pre-existing symlink that leads
     ///   outside the destination.
     /// - Total decompressed output is capped by `limits.maxTotalUncompressedSize`.
-    public func extractAll(to directory: URL, overwrite: Bool = false) throws {
+    ///
+    /// - Parameter progress: Called after each decompressed chunk with the
+    ///   accumulated progress across all entries, and once on completion.
+    @concurrent
+    public func extractAll(
+        to directory: URL,
+        overwrite: Bool = false,
+        progress: ZipProgressHandler? = nil
+    ) async throws {
         let fileManager = FileManager.default
         try fileManager.createDirectory(at: directory, withIntermediateDirectories: true)
         let rootPath = directory.resolvingSymlinksInPath().standardizedFileURL.path
         var totalBytes: UInt64 = 0
 
+        // Progress total: the declared uncompressed size of every entry that
+        // will be written (clamped; hostile archives can declare huge sizes).
+        var progressTotal: UInt64 = 0
+        for entry in entries where !entry.isSymbolicLink && !entry.isDirectory {
+            let (sum, didOverflow) = progressTotal.addingReportingOverflow(entry.uncompressedSize)
+            progressTotal = didOverflow ? .max : sum
+        }
+        var completedBytes: UInt64 = 0
+
         for entry in entries {
+            try Task.checkCancellation()
             if entry.isSymbolicLink { continue }
 
             guard let relativePath = ZipPath.sanitizedRelativePath(entry.path) else {
@@ -505,7 +557,14 @@ public struct ZipArchive: Sendable {
 
             // Streams the entry to disk with constant memory usage and applies
             // permissions and dates; also refuses to write through symlinks.
-            try extract(entry, to: target, overwrite: overwrite)
+            try extractEntry(
+                entry, to: target, overwrite: overwrite,
+                completedBase: completedBytes, totalBytes: progressTotal, progress: progress
+            )
+            completedBytes += entry.uncompressedSize
         }
+        progress?(ZipProgress(
+            completedBytes: completedBytes, totalBytes: progressTotal, currentPath: nil
+        ))
     }
 }

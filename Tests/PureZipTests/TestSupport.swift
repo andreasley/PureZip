@@ -170,3 +170,32 @@ func withTemporaryDirectory<T>(_ body: (URL) throws -> T) throws -> T {
     defer { try? FileManager.default.removeItem(at: url) }
     return try body(url)
 }
+
+/// Creates a unique temporary directory, runs the async `body` with it, and cleans up.
+func withTemporaryDirectory<T>(_ body: (URL) async throws -> T) async throws -> T {
+    let url = FileManager.default.temporaryDirectory
+        .appendingPathComponent("PureZipTests-\(UUID().uuidString)", isDirectory: true)
+    try FileManager.default.createDirectory(at: url, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: url) }
+    return try await body(url)
+}
+
+// MARK: - Progress collection
+
+/// Collects `ZipProgress` snapshots from `@Sendable` progress callbacks.
+final class ProgressLog: @unchecked Sendable {
+    private let lock = NSLock()
+    private var collected: [ZipProgress] = []
+
+    func append(_ snapshot: ZipProgress) {
+        lock.lock()
+        defer { lock.unlock() }
+        collected.append(snapshot)
+    }
+
+    var snapshots: [ZipProgress] {
+        lock.lock()
+        defer { lock.unlock() }
+        return collected
+    }
+}

@@ -168,11 +168,11 @@ struct FilenameTests {
         #expect(archive.entries.first?.path == "ünflagged.txt")
     }
 
-    @Test func backslashSeparatorsAreTreatedAsPathSeparators() throws {
+    @Test func backslashSeparatorsAreTreatedAsPathSeparators() async throws {
         let data = buildRawZip([.stored(name: "dir\\sub\\file.txt", content: [UInt8]("x".utf8))])
         let archive = try ZipArchive(data: data)
-        try withTemporaryDirectory { directory in
-            try archive.extractAll(to: directory)
+        try await withTemporaryDirectory { directory in
+            try await archive.extractAll(to: directory)
             let extracted = directory.appendingPathComponent("dir/sub/file.txt")
             #expect(FileManager.default.fileExists(atPath: extracted.path))
         }
@@ -185,13 +185,13 @@ struct FilenameTests {
 struct SecurityTests {
     @Test("Path traversal attempts are rejected",
           arguments: ["../evil.txt", "a/../../evil.txt", "..", "C:\\evil.txt", "..\\evil.txt"])
-    func pathTraversalRejected(maliciousPath: String) throws {
+    func pathTraversalRejected(maliciousPath: String) async throws {
         let data = buildRawZip([.stored(name: maliciousPath, content: [UInt8]("pwned".utf8))])
         let archive = try ZipArchive(data: data)
-        try withTemporaryDirectory { directory in
+        try await withTemporaryDirectory { directory in
             let destination = directory.appendingPathComponent("dest", isDirectory: true)
-            #expect(throws: ZipError.unsafePath(maliciousPath)) {
-                try archive.extractAll(to: destination)
+            await #expect(throws: ZipError.unsafePath(maliciousPath)) {
+                try await archive.extractAll(to: destination)
             }
             // Nothing may have escaped into the parent directory.
             let escaped = directory.appendingPathComponent("evil.txt")
@@ -199,24 +199,24 @@ struct SecurityTests {
         }
     }
 
-    @Test func absolutePathsAreExtractedInsideDestination() throws {
+    @Test func absolutePathsAreExtractedInsideDestination() async throws {
         let data = buildRawZip([.stored(name: "/abs.txt", content: [UInt8]("safe".utf8))])
         let archive = try ZipArchive(data: data)
-        try withTemporaryDirectory { directory in
-            try archive.extractAll(to: directory)
+        try await withTemporaryDirectory { directory in
+            try await archive.extractAll(to: directory)
             let inside = directory.appendingPathComponent("abs.txt")
             #expect(try Data(contentsOf: inside) == Data("safe".utf8))
             #expect(!FileManager.default.fileExists(atPath: "/abs.txt"))
         }
     }
 
-    @Test func symlinkEntriesAreNeverExtracted() throws {
+    @Test func symlinkEntriesAreNeverExtracted() async throws {
         var link = RawZipEntry.stored(name: "innocent", content: [UInt8]("/etc/passwd".utf8))
         link.externalAttributes = 0o120777 << 16 // S_IFLNK
         let archive = try ZipArchive(data: buildRawZip([link]))
         #expect(archive.entries.first?.isSymbolicLink == true)
-        try withTemporaryDirectory { directory in
-            try archive.extractAll(to: directory)
+        try await withTemporaryDirectory { directory in
+            try await archive.extractAll(to: directory)
             let target = directory.appendingPathComponent("innocent")
             // Neither a symlink nor a file may exist.
             #expect((try? FileManager.default.attributesOfItem(atPath: target.path)) == nil)
@@ -232,7 +232,7 @@ struct SecurityTests {
         }
     }
 
-    @Test func zipBombTotalSizeLimit() throws {
+    @Test func zipBombTotalSizeLimit() async throws {
         // Three highly compressible entries; the total exceeds the configured cap.
         let writer = ZipWriter()
         for i in 0..<3 {
@@ -243,9 +243,9 @@ struct SecurityTests {
 
         let limits = ZipSecurityLimits(maxTotalUncompressedSize: 1_000_000)
         let archive = try ZipArchive(data: data, limits: limits)
-        try withTemporaryDirectory { directory in
-            #expect(throws: ZipError.self) {
-                try archive.extractAll(to: directory)
+        try await withTemporaryDirectory { directory in
+            await #expect(throws: ZipError.self) {
+                try await archive.extractAll(to: directory)
             }
         }
     }
@@ -356,8 +356,8 @@ struct SecurityTests {
 
 @Suite("File and folder operations")
 struct FileSystemTests {
-    @Test func folderRoundTrip() throws {
-        try withTemporaryDirectory { directory in
+    @Test func folderRoundTrip() async throws {
+        try await withTemporaryDirectory { directory in
             let fileManager = FileManager.default
             let source = directory.appendingPathComponent("Source Földer", isDirectory: true)
             try fileManager.createDirectory(
@@ -381,13 +381,13 @@ struct FileSystemTests {
             )
 
             let archiveURL = directory.appendingPathComponent("out.zip")
-            try PureZip.zipItem(at: source, to: archiveURL)
+            try await PureZip.zipItem(at: source, to: archiveURL)
 
             let archive = try ZipArchive(url: archiveURL)
             #expect(archive["Source Földer/link"] == nil, "symlinks must be skipped")
 
             let destination = directory.appendingPathComponent("extracted", isDirectory: true)
-            try PureZip.unzipItem(at: archiveURL, to: destination)
+            try await PureZip.unzipItem(at: archiveURL, to: destination)
 
             let extractedRoot = destination.appendingPathComponent("Source Földer")
             #expect(
@@ -418,27 +418,86 @@ struct FileSystemTests {
         }
     }
 
-    @Test func singleFileZipItem() throws {
-        try withTemporaryDirectory { directory in
+    @Test func singleFileZipItem() async throws {
+        try await withTemporaryDirectory { directory in
             let file = directory.appendingPathComponent("solo.txt")
             try Data("just one file".utf8).write(to: file)
             let archiveURL = directory.appendingPathComponent("solo.zip")
-            try PureZip.zipItem(at: file, to: archiveURL)
+            try await PureZip.zipItem(at: file, to: archiveURL)
             let archive = try ZipArchive(url: archiveURL)
             #expect(archive.entries.map(\.path) == ["solo.txt"])
             #expect(try archive.extractData(at: "solo.txt") == Data("just one file".utf8))
         }
     }
 
-    @Test func overwriteBehavior() throws {
-        try withTemporaryDirectory { directory in
+    @Test func overwriteBehavior() async throws {
+        try await withTemporaryDirectory { directory in
             let writer = ZipWriter()
             try writer.addFile(path: "f.txt", data: Data("v1".utf8))
             let archive = try ZipArchive(data: writer.finalize())
-            try archive.extractAll(to: directory)
-            #expect(throws: ZipError.self) { try archive.extractAll(to: directory) }
-            try archive.extractAll(to: directory, overwrite: true)
+            try await archive.extractAll(to: directory)
+            await #expect(throws: ZipError.self) { try await archive.extractAll(to: directory) }
+            try await archive.extractAll(to: directory, overwrite: true)
             #expect(try Data(contentsOf: directory.appendingPathComponent("f.txt")) == Data("v1".utf8))
+        }
+    }
+
+    @Test func zipAndUnzipReportProgress() async throws {
+        try await withTemporaryDirectory { directory in
+            let source = directory.appendingPathComponent("folder", isDirectory: true)
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+            let sizes = [2_000_000, 700_000, 0]
+            for (index, size) in sizes.enumerated() {
+                try mixedData(count: size, seed: UInt64(index)).write(
+                    to: source.appendingPathComponent("file\(index).bin")
+                )
+            }
+            let expectedTotal = UInt64(sizes.reduce(0, +))
+
+            let archiveURL = directory.appendingPathComponent("out.zip")
+            let zipLog = ProgressLog()
+            try await PureZip.zipItem(at: source, to: archiveURL) { zipLog.append($0) }
+
+            let zipSnapshots = zipLog.snapshots
+            #expect(zipSnapshots.count > 1, "multi-chunk input should report more than once")
+            #expect(zipSnapshots.allSatisfy { $0.totalBytes == expectedTotal })
+            let zipCompleted = zipSnapshots.map(\.completedBytes)
+            #expect(zipCompleted == zipCompleted.sorted(), "progress must be monotonic")
+            #expect(zipSnapshots.last?.completedBytes == expectedTotal)
+            #expect(zipSnapshots.last?.fraction == 1)
+
+            let destination = directory.appendingPathComponent("extracted", isDirectory: true)
+            let unzipLog = ProgressLog()
+            try await PureZip.unzipItem(at: archiveURL, to: destination) { unzipLog.append($0) }
+
+            let unzipSnapshots = unzipLog.snapshots
+            #expect(unzipSnapshots.allSatisfy { $0.totalBytes == expectedTotal })
+            let unzipCompleted = unzipSnapshots.map(\.completedBytes)
+            #expect(unzipCompleted == unzipCompleted.sorted(), "progress must be monotonic")
+            #expect(unzipSnapshots.last?.completedBytes == expectedTotal)
+            #expect(unzipSnapshots.last?.fraction == 1)
+        }
+    }
+
+    @Test func cancelledZipItemThrowsAndCleansUp() async throws {
+        try await withTemporaryDirectory { directory in
+            let source = directory.appendingPathComponent("folder", isDirectory: true)
+            try FileManager.default.createDirectory(at: source, withIntermediateDirectories: true)
+            // Several chunks, so a cancellation check runs after the first report.
+            try mixedData(count: 3_000_000, seed: 5).write(
+                to: source.appendingPathComponent("big.bin")
+            )
+
+            let archiveURL = directory.appendingPathComponent("out.zip")
+            let task = Task {
+                // Cancel ourselves after the first progress report.
+                try await PureZip.zipItem(at: source, to: archiveURL) { _ in
+                    withUnsafeCurrentTask { $0?.cancel() }
+                }
+            }
+            await #expect(throws: CancellationError.self) { try await task.value }
+            #expect(!FileManager.default.fileExists(atPath: archiveURL.path),
+                    "a cancelled zipItem must not leave a partial archive")
         }
     }
 }
@@ -460,7 +519,7 @@ struct InteropTests {
         UEsDBBQAAgAIAGeFDF1pL4uTWQAAACgjAAAMAAAAZGVmbGF0ZWQudHh07crLEYIwFADAVl4FVJMGQIN/A9GoUL20wcyed9M5x9wuh1sMtXyfMZZfXNtjekX55Brvje/9usSxnLpIsizLsizLsizLsizLsizLsizLsizLsizLsrzP/AdQSwECHgMUAAIACABnhQxdaS+Lk1kAAAAoIwAADAAAAAAAAAABAAAApIEAAAAAZGVmbGF0ZWQudHh0UEsFBgAAAAABAAEAOgAAAIMAAAAAAA==
         """
 
-    @Test func readsInfoZipArchive() throws {
+    @Test func readsInfoZipArchive() async throws {
         let data = try #require(Data(base64Encoded: Self.infoZipFixtureBase64))
         let archive = try ZipArchive(data: data)
         let paths = Set(archive.entries.map(\.path))
@@ -474,8 +533,8 @@ struct InteropTests {
         #expect(try archive.extractData(at: "Ördnér/日本語ファイル.txt") == Data("こんにちは".utf8))
         #expect(try archive.extractData(at: "Ördnér/nested/emoji 😀.txt") == Data("party".utf8))
 
-        try withTemporaryDirectory { directory in
-            try archive.extractAll(to: directory)
+        try await withTemporaryDirectory { directory in
+            try await archive.extractAll(to: directory)
             let file = directory.appendingPathComponent("Ördnér/nested/emoji 😀.txt")
             #expect(try Data(contentsOf: file) == Data("party".utf8))
         }

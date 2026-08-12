@@ -13,6 +13,7 @@ A pure-Swift ZIP library — read, write, compress, and extract ZIP archives wit
 - **Robust filename handling**: UTF-8 (flagged and unflagged), the Info-ZIP Unicode Path extra field, and CP437 fallback for legacy archives
 - **Metadata**: DOS timestamps and POSIX permissions round-trip through the archive
 - **Three compression levels**: `.fastest`, `.normal`, `.maximum`
+- **Async high-level API**: `zipItem`, `unzipItem`, `extractAll`, and `extract(_:to:)` are `async`, run off the caller's actor, report byte-level progress through a `@Sendable` callback, and stop on task cancellation
 - **Interoperable**: archives verify cleanly with Info-ZIP's `unzip -t`; archives from other tools (Info-ZIP, zlib streams) read correctly
 
 ### Security hardening
@@ -35,10 +36,15 @@ Malicious or broken archives are treated as hostile input everywhere:
 import PureZip
 
 // Compress a folder (or a single file) into a ZIP archive.
-try PureZip.zipItem(at: folderURL, to: archiveURL)
+try await PureZip.zipItem(at: folderURL, to: archiveURL)
 
 // Extract an archive into a directory (created if needed).
-try PureZip.unzipItem(at: archiveURL, to: destinationURL)
+try await PureZip.unzipItem(at: archiveURL, to: destinationURL)
+
+// Both report progress and honor task cancellation.
+try await PureZip.zipItem(at: folderURL, to: archiveURL) { progress in
+    print("\(progress.completedBytes) of \(progress.totalBytes ?? 0) bytes")
+}
 ```
 
 ### Stream an archive to disk (constant memory)
@@ -83,10 +89,11 @@ for entry in archive.entries {
 let readme = try archive.extractData(at: "docs/readme.txt")
 
 // Extract everything to disk (streams each entry; constant memory).
-try archive.extractAll(to: destinationURL, overwrite: false)
+// Reports progress and honors task cancellation.
+try await archive.extractAll(to: destinationURL, overwrite: false)
 
 // Stream a single entry to a file, or consume it in chunks.
-try archive.extract(entry, to: fileURL)
+try await archive.extract(entry, to: fileURL)
 try archive.extract(entry) { chunk in
     hasher.update(data: chunk)
 }
@@ -139,7 +146,7 @@ Run the suite yourself with `swift test -c release` (the `Performance` suite pri
 - Appending to and updating existing archives
 - Optional symlink round-tripping behind an explicit opt-in flag
 - Zstandard / LZMA entry support
-- async/await variants with progress reporting and cancellation
+- Async variants of the streaming writer APIs (`ZipWriter`/`ZipFileWriter`)
 - Multithreaded compression of independent entries
 - Extended timestamp (0x5455) and Unix extra fields for full-fidelity metadata
 - Linux support validation and CI
@@ -152,7 +159,7 @@ Run the suite yourself with `swift test -c release` (the `Performance` suite pri
 
 ## Testing
 
-86 test cases cover round trips across sizes, levels, and content types; streaming compression and extraction (chunked writes, cross-chunk matches, window sliding, partial-file cleanup); tricky filenames (emoji, CJK, combining accents, CP437, very long names); real-world fixtures created by Info-ZIP and zlib; verification of generated archives with the system `unzip`; and the full attack surface: traversal payloads, symlinks, ZIP bombs, lying size headers, flipped bytes, truncation, and garbage input.
+88 test cases cover round trips across sizes, levels, and content types; streaming compression and extraction (chunked writes, cross-chunk matches, window sliding, partial-file cleanup); tricky filenames (emoji, CJK, combining accents, CP437, very long names); real-world fixtures created by Info-ZIP and zlib; verification of generated archives with the system `unzip`; and the full attack surface: traversal payloads, symlinks, ZIP bombs, lying size headers, flipped bytes, truncation, and garbage input.
 
 ```sh
 swift test              # fast, debug

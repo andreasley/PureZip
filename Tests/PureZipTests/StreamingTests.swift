@@ -93,8 +93,8 @@ struct StreamingTests {
         #expect(collected == payload)
     }
 
-    @Test func extractToFileStreamsAndVerifies() throws {
-        try withTemporaryDirectory { directory in
+    @Test func extractToFileStreamsAndVerifies() async throws {
+        try await withTemporaryDirectory { directory in
             let payload = mixedData(count: 2_000_000, seed: 66)
             let writer = ZipWriter()
             try writer.addFile(path: "data.bin", data: payload, permissions: 0o600)
@@ -102,18 +102,21 @@ struct StreamingTests {
             let entry = try #require(archive["data.bin"])
 
             let target = directory.appendingPathComponent("data.bin")
-            try archive.extract(entry, to: target)
+            let log = ProgressLog()
+            try await archive.extract(entry, to: target) { log.append($0) }
             #expect(try Data(contentsOf: target) == payload)
+            #expect(log.snapshots.last?.completedBytes == UInt64(payload.count))
+            #expect(log.snapshots.last?.fraction == 1)
 
-            #expect(throws: ZipError.destinationExists(target.path)) {
-                try archive.extract(entry, to: target)
+            await #expect(throws: ZipError.destinationExists(target.path)) {
+                try await archive.extract(entry, to: target)
             }
-            try archive.extract(entry, to: target, overwrite: true)
+            try await archive.extract(entry, to: target, overwrite: true)
         }
     }
 
-    @Test func corruptEntryLeavesNoPartialFile() throws {
-        try withTemporaryDirectory { directory in
+    @Test func corruptEntryLeavesNoPartialFile() async throws {
+        try await withTemporaryDirectory { directory in
             let payload = mixedData(count: 500_000, seed: 33)
             var entry = RawZipEntry(name: "bad.bin")
             entry.method = 8
@@ -123,8 +126,8 @@ struct StreamingTests {
             let archive = try ZipArchive(data: buildRawZip([entry]))
 
             let target = directory.appendingPathComponent("bad.bin")
-            #expect(throws: ZipError.checksumMismatch("bad.bin")) {
-                try archive.extract(archive.entries[0], to: target)
+            await #expect(throws: ZipError.checksumMismatch("bad.bin")) {
+                try await archive.extract(archive.entries[0], to: target)
             }
             #expect(!FileManager.default.fileExists(atPath: target.path),
                     "a failed extraction must not leave a partial file")

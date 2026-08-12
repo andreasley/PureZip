@@ -1,0 +1,5 @@
+A substantial portion of the source code in this project was generated
+with the assistance of AI coding tools. No representation is made that
+the code is free of defects or of third-party intellectual property 
+claims. Users are responsible for their own review and validation
+before relying on this software in production.

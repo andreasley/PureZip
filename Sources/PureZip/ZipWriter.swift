@@ -116,6 +116,39 @@ public final class ZipWriter {
         ))
     }
 
+    /// Adds a symbolic link entry pointing at `target`.
+    ///
+    /// The target path is recorded verbatim as the entry's contents, with
+    /// Unix S_IFLNK external attributes. Policy enforcement
+    /// (`ZipSymlinkPolicy`) happens in `PureZip.zipItem` and on extraction,
+    /// not here — the caller of this low-level API decides what to record.
+    public func addSymbolicLink(
+        path: String,
+        target: String,
+        modificationDate: Date = Date(),
+        permissions: UInt16 = 0o755
+    ) throws {
+        let normalizedPath = try ZipPath.normalizedArchivePath(path, isDirectory: false)
+        guard addedPaths.insert(normalizedPath).inserted else {
+            throw ZipError.duplicateEntry(normalizedPath)
+        }
+        guard !target.isEmpty, !target.contains("\0") else {
+            throw ZipError.invalidPath(target)
+        }
+        let targetData = Data(target.utf8)
+        let externalAttributes = (UInt32(permissions & 0o7777) | 0o120000) << 16
+        try addEntry(
+            normalizedPath: normalizedPath,
+            method: 0,
+            crc32: CRC32.checksum(targetData),
+            uncompressedSize: UInt64(targetData.count),
+            payload: nil,
+            storedData: targetData,
+            modificationDate: modificationDate,
+            externalAttributes: externalAttributes
+        )
+    }
+
     /// Adds a directory entry.
     public func addDirectory(
         path: String,

@@ -318,16 +318,79 @@ struct SecurityTests {
         }
     }
 
-    @Test func symlinkEntriesAreNeverExtracted() async throws {
+    @Test func symlinkExtractionPolicies() async throws {
         var link = RawZipEntry.stored(name: "innocent", content: [UInt8]("/etc/passwd".utf8))
         link.externalAttributes = 0o120777 << 16 // S_IFLNK
-        let archive = try ZipArchive(data: buildRawZip([link]))
-        #expect(archive.entries.first?.isSymbolicLink == true)
+        let data = buildRawZip([link])
+
         try await withTemporaryDirectory { directory in
-            try await archive.extractAll(to: directory)
-            let target = directory.appendingPathComponent("innocent")
-            // Neither a symlink nor a file may exist.
-            #expect((try? FileManager.default.attributesOfItem(atPath: target.path)) == nil)
+            // Default (confined): an absolute target is rejected and nothing
+            // is created on disk.
+            let confined = try ZipArchive(data: data)
+            #expect(confined.entries.first?.isSymbolicLink == true)
+            let confinedTarget = directory.appendingPathComponent("confined", isDirectory: true)
+            await #expect(throws: ZipError.symlinkNotPermitted("innocent")) {
+                try await confined.extractAll(to: confinedTarget)
+            }
+            let confinedLink = confinedTarget.appendingPathComponent("innocent")
+            #expect((try? FileManager.default.attributesOfItem(atPath: confinedLink.path)) == nil)
+
+            // reject: same outcome for any symlink entry.
+            let reject = try ZipArchive(
+                data: data, limits: ZipSecurityLimits(symlinkPolicy: .reject)
+            )
+            await #expect(throws: ZipError.symlinkNotPermitted("innocent")) {
+                try await reject.extractAll(to: directory.appendingPathComponent("reject"))
+            }
+
+            // unrestricted: the link is recreated verbatim (nothing is
+            // written through it).
+            let unrestricted = try ZipArchive(
+                data: data, limits: ZipSecurityLimits(symlinkPolicy: .unrestricted)
+            )
+            let unrestrictedTarget = directory.appendingPathComponent("open", isDirectory: true)
+            try await unrestricted.extractAll(to: unrestrictedTarget)
+            let created = unrestrictedTarget.appendingPathComponent("innocent").path
+            #expect(try FileManager.default.destinationOfSymbolicLink(atPath: created) == "/etc/passwd")
+        }
+    }
+
+    @Test func escapingRelativeSymlinkTargetIsRejected() async throws {
+        // "sub/link" -> "../../escape" lexically leaves the destination.
+        let writer = ZipWriter()
+        try writer.addSymbolicLink(path: "sub/link", target: "../../escape")
+        let archive = try ZipArchive(data: writer.finalize())
+        try await withTemporaryDirectory { directory in
+            await #expect(throws: ZipError.symlinkNotPermitted("sub/link")) {
+                try await archive.extractAll(to: directory)
+            }
+        }
+
+        // One level less stays inside and must extract.
+        let okWriter = ZipWriter()
+        try okWriter.addSymbolicLink(path: "sub/link", target: "../sibling.txt")
+        let okArchive = try ZipArchive(data: okWriter.finalize())
+        try await withTemporaryDirectory { directory in
+            try await okArchive.extractAll(to: directory)
+            let created = directory.appendingPathComponent("sub/link").path
+            #expect(try FileManager.default.destinationOfSymbolicLink(atPath: created) == "../sibling.txt")
+        }
+    }
+
+    @Test func filesAreNeverWrittenThroughEscapingSymlinks() async throws {
+        // Even with .unrestricted, a file entry whose parent chain passes
+        // through a link that leaves the destination must be refused.
+        let writer = ZipWriter()
+        try writer.addSymbolicLink(path: "dir", target: "/private/tmp")
+        try await writer.addFile(path: "dir/evil.txt", data: Data("pwned".utf8))
+        let archive = try ZipArchive(
+            data: writer.finalize(), limits: ZipSecurityLimits(symlinkPolicy: .unrestricted)
+        )
+        try await withTemporaryDirectory { directory in
+            await #expect(throws: ZipError.unsafePath("dir/evil.txt")) {
+                try await archive.extractAll(to: directory)
+            }
+            #expect(!FileManager.default.fileExists(atPath: "/private/tmp/evil.txt"))
         }
     }
 
@@ -482,17 +545,17 @@ struct FileSystemTests {
             try Data("#!/bin/sh\necho hi\n".utf8).write(to: script)
             try fileManager.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script.path)
             try Data().write(to: source.appendingPathComponent("empty.bin"))
-            // A symlink that must not end up in the archive.
+            // A confined symlink that must round-trip.
             try fileManager.createSymbolicLink(
-                at: source.appendingPathComponent("link"),
-                withDestinationURL: URL(fileURLWithPath: "/etc/hosts")
+                atPath: source.appendingPathComponent("link").path,
+                withDestinationPath: "Notes älpha.txt"
             )
 
             let archiveURL = directory.appendingPathComponent("out.zip")
             try await PureZip.zipItem(at: source, to: archiveURL)
 
             let archive = try ZipArchive(url: archiveURL)
-            #expect(archive["Source Földer/link"] == nil, "symlinks must be skipped")
+            #expect(archive["Source Földer/link"]?.isSymbolicLink == true)
 
             let destination = directory.appendingPathComponent("extracted", isDirectory: true)
             try await PureZip.unzipItem(at: archiveURL, to: destination)
@@ -522,7 +585,120 @@ struct FileSystemTests {
             let permissions = (scriptAttributes[.posixPermissions] as? NSNumber)?.uint16Value ?? 0
             #expect(permissions & 0o777 == 0o755, "executable bit should survive")
 
-            #expect(!fileManager.fileExists(atPath: extractedRoot.appendingPathComponent("link").path))
+            let extractedLink = extractedRoot.appendingPathComponent("link").path
+            #expect(try fileManager.destinationOfSymbolicLink(atPath: extractedLink) == "Notes älpha.txt")
+            #expect(
+                try Data(contentsOf: extractedRoot.appendingPathComponent("link"))
+                    == Data("Hello from PureZip".utf8),
+                "reading through the recreated link must reach the real file"
+            )
+        }
+    }
+
+    @Test func frameworkBundleRoundTrip() async throws {
+        // The symlink layout of a macOS framework bundle: everything reaches
+        // the real files through relative, in-tree links.
+        try await withTemporaryDirectory { directory in
+            let fileManager = FileManager.default
+            let bundle = directory.appendingPathComponent("MyLib.framework", isDirectory: true)
+            let versionA = bundle.appendingPathComponent("Versions/A", isDirectory: true)
+            try fileManager.createDirectory(
+                at: versionA.appendingPathComponent("Resources"), withIntermediateDirectories: true
+            )
+            let binary = mixedData(count: 100_000, seed: 71)
+            try binary.write(to: versionA.appendingPathComponent("MyLib"))
+            try Data("plist".utf8).write(
+                to: versionA.appendingPathComponent("Resources/Info.plist")
+            )
+            try fileManager.createSymbolicLink(
+                atPath: bundle.appendingPathComponent("Versions/Current").path,
+                withDestinationPath: "A"
+            )
+            try fileManager.createSymbolicLink(
+                atPath: bundle.appendingPathComponent("MyLib").path,
+                withDestinationPath: "Versions/Current/MyLib"
+            )
+            try fileManager.createSymbolicLink(
+                atPath: bundle.appendingPathComponent("Resources").path,
+                withDestinationPath: "Versions/Current/Resources"
+            )
+
+            let archiveURL = directory.appendingPathComponent("framework.zip")
+            try await PureZip.zipItem(at: bundle, to: archiveURL)
+            let destination = directory.appendingPathComponent("extracted", isDirectory: true)
+            try await PureZip.unzipItem(at: archiveURL, to: destination)
+
+            let extracted = destination.appendingPathComponent("MyLib.framework")
+            #expect(
+                try fileManager.destinationOfSymbolicLink(
+                    atPath: extracted.appendingPathComponent("Versions/Current").path
+                ) == "A"
+            )
+            #expect(
+                try fileManager.destinationOfSymbolicLink(
+                    atPath: extracted.appendingPathComponent("MyLib").path
+                ) == "Versions/Current/MyLib"
+            )
+            // Reading through the two-level link chain must reach the binary.
+            #expect(try Data(contentsOf: extracted.appendingPathComponent("MyLib")) == binary)
+            #expect(
+                try Data(contentsOf: extracted.appendingPathComponent("Resources/Info.plist"))
+                    == Data("plist".utf8)
+            )
+        }
+    }
+
+    @Test func zipItemSymlinkPolicies() async throws {
+        try await withTemporaryDirectory { directory in
+            let fileManager = FileManager.default
+            let source = directory.appendingPathComponent("tree", isDirectory: true)
+            try fileManager.createDirectory(
+                at: source.appendingPathComponent("sub"), withIntermediateDirectories: true
+            )
+            try Data("data".utf8).write(to: source.appendingPathComponent("file.txt"))
+            // Lexically escapes the tree: sub/../../<outside>.
+            try fileManager.createSymbolicLink(
+                atPath: source.appendingPathComponent("sub/escape").path,
+                withDestinationPath: "../../outside.txt"
+            )
+
+            // Default (confined): the escaping link is rejected.
+            let confinedURL = directory.appendingPathComponent("confined.zip")
+            await #expect(throws: ZipError.symlinkNotPermitted("tree/sub/escape")) {
+                try await PureZip.zipItem(at: source, to: confinedURL)
+            }
+
+            // reject: any symlink throws, even a confined one.
+            try fileManager.removeItem(at: source.appendingPathComponent("sub/escape"))
+            try fileManager.createSymbolicLink(
+                atPath: source.appendingPathComponent("sub/confined").path,
+                withDestinationPath: "../file.txt"
+            )
+            let rejectURL = directory.appendingPathComponent("reject.zip")
+            await #expect(throws: ZipError.symlinkNotPermitted("tree/sub/confined")) {
+                try await PureZip.zipItem(at: source, to: rejectURL, symlinkPolicy: .reject)
+            }
+
+            // confined accepts an in-tree relative link.
+            let okURL = directory.appendingPathComponent("ok.zip")
+            try await PureZip.zipItem(at: source, to: okURL)
+            let archive = try ZipArchive(url: okURL)
+            let link = try #require(archive["tree/sub/confined"])
+            #expect(link.isSymbolicLink)
+            #expect(try archive.extractData(link) == Data("../file.txt".utf8))
+
+            // unrestricted archives an absolute link verbatim.
+            try fileManager.createSymbolicLink(
+                atPath: source.appendingPathComponent("absolute").path,
+                withDestinationPath: "/etc/hosts"
+            )
+            let unrestrictedURL = directory.appendingPathComponent("unrestricted.zip")
+            try await PureZip.zipItem(
+                at: source, to: unrestrictedURL, symlinkPolicy: .unrestricted
+            )
+            let unrestricted = try ZipArchive(url: unrestrictedURL)
+            let absolute = try #require(unrestricted["tree/absolute"])
+            #expect(try unrestricted.extractData(absolute) == Data("/etc/hosts".utf8))
         }
     }
 

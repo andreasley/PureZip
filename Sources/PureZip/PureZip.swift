@@ -25,13 +25,17 @@ import Foundation
 /// Safety: extraction verifies CRC-32 checksums and declared sizes, enforces
 /// configurable decompression limits (`ZipSecurityLimits`) to stop ZIP bombs,
 /// sanitizes entry paths so no file can be written outside the destination
-/// directory, and never creates symbolic links.
+/// directory, and restricts symbolic links according to `ZipSymlinkPolicy`
+/// (by default only links confined to the destination are created).
 public enum PureZip {
     /// Compresses a file or directory into a new ZIP archive.
     ///
     /// For a directory, the directory itself becomes the archive's top-level
     /// entry (matching Finder's behavior). Symbolic links inside the tree are
-    /// skipped.
+    /// handled according to `symlinkPolicy`; the default (`.confined`)
+    /// round-trips links that stay inside the tree — enough for
+    /// self-contained structures like macOS framework bundles — and throws
+    /// `ZipError.symlinkNotPermitted` for links that point outside it.
     ///
     /// Runs off the caller's actor. Cancelling the surrounding task stops the
     /// operation with `CancellationError` and removes the partial archive.
@@ -40,6 +44,7 @@ public enum PureZip {
     ///   - sourceURL: File or directory to compress.
     ///   - destinationURL: Where to write the `.zip` file.
     ///   - level: Compression speed/ratio trade-off.
+    ///   - symlinkPolicy: How symbolic links inside the tree are handled.
     ///   - overwrite: Replace an existing file at `destinationURL`.
     ///   - progress: Called periodically with a snapshot of the operation's
     ///     progress, measured in uncompressed bytes read.
@@ -48,6 +53,7 @@ public enum PureZip {
         at sourceURL: URL,
         to destinationURL: URL,
         level: CompressionLevel = .normal,
+        symlinkPolicy: ZipSymlinkPolicy = .confined,
         overwrite: Bool = false,
         progress: ZipProgressHandler? = nil
     ) async throws {
@@ -63,7 +69,9 @@ public enum PureZip {
         do {
             let totalBytes: UInt64
             if isDirectory.boolValue {
-                totalBytes = try addDirectoryTree(at: sourceURL, to: writer, progress: progress)
+                totalBytes = try addDirectoryTree(
+                    at: sourceURL, to: writer, symlinkPolicy: symlinkPolicy, progress: progress
+                )
             } else {
                 totalBytes = fileSize(at: sourceURL) ?? 0
                 var completedBytes: UInt64 = 0
@@ -108,7 +116,10 @@ public enum PureZip {
     /// Adds the directory tree rooted at `rootURL` and returns the total
     /// number of file bytes that were read (the progress total).
     private static func addDirectoryTree(
-        at rootURL: URL, to writer: ZipFileWriter, progress: ZipProgressHandler?
+        at rootURL: URL,
+        to writer: ZipFileWriter,
+        symlinkPolicy: ZipSymlinkPolicy,
+        progress: ZipProgressHandler?
     ) throws -> UInt64 {
         let fileManager = FileManager.default
         let root = rootURL.standardizedFileURL
@@ -119,24 +130,23 @@ public enum PureZip {
             permissions: posixPermissions(at: root) ?? 0o755
         )
 
-        let keys: [URLResourceKey] = [
+        let keys: Set<URLResourceKey> = [
             .isDirectoryKey, .isSymbolicLinkKey, .contentModificationDateKey, .fileSizeKey,
         ]
-        guard let enumerator = fileManager.enumerator(
-            at: root, includingPropertiesForKeys: keys, options: []
-        ) else {
+        // The path-based enumerator yields relative paths directly. (The
+        // URL-based one returns canonicalized /private-prefixed URLs whose
+        // prefixes don't reliably match any form of the root URL, which
+        // breaks deriving relative paths lexically.)
+        guard let enumerator = fileManager.enumerator(atPath: root.path) else {
             throw ZipError.entryNotFound(root.path)
         }
 
         // Sort for deterministic archive layout.
         var children: [(relativePath: String, url: URL, values: URLResourceValues)] = []
-        let rootPathLength = root.path.count + 1
-        for case let url as URL in enumerator {
-            let standardized = url.standardizedFileURL
-            let relativePath = String(standardized.path.dropFirst(rootPathLength))
-            guard !relativePath.isEmpty else { continue }
-            let values = try standardized.resourceValues(forKeys: Set(keys))
-            children.append((relativePath, standardized, values))
+        for case let relativePath as String in enumerator {
+            let url = root.appendingPathComponent(relativePath)
+            let values = try url.resourceValues(forKeys: keys)
+            children.append((relativePath, url, values))
         }
         children.sort { $0.relativePath < $1.relativePath }
 
@@ -150,8 +160,15 @@ public enum PureZip {
         var completedBytes: UInt64 = 0
         for (relativePath, url, values) in children {
             try Task.checkCancellation()
-            if values.isSymbolicLink == true { continue }
             let archivePath = rootName + "/" + relativePath
+            if values.isSymbolicLink == true {
+                try addSymbolicLink(
+                    at: url, archivePath: archivePath,
+                    linkDirectory: (relativePath as NSString).deletingLastPathComponent,
+                    policy: symlinkPolicy, to: writer
+                )
+                continue
+            }
             if values.isDirectory == true {
                 try writer.addDirectory(
                     path: archivePath,
@@ -166,6 +183,33 @@ public enum PureZip {
             }
         }
         return totalBytes
+    }
+
+    /// Archives one symbolic link, enforcing the symlink policy. The
+    /// confinement check is lexical, relative to the tree root (of which
+    /// `linkDirectory` is the link's directory part).
+    private static func addSymbolicLink(
+        at url: URL,
+        archivePath: String,
+        linkDirectory: String,
+        policy: ZipSymlinkPolicy,
+        to writer: ZipFileWriter
+    ) throws {
+        guard policy != .reject else {
+            throw ZipError.symlinkNotPermitted(archivePath)
+        }
+        let target = try FileManager.default.destinationOfSymbolicLink(atPath: url.path)
+        if policy == .confined {
+            guard ZipPath.symlinkTargetIsConfined(target, linkDirectory: linkDirectory) else {
+                throw ZipError.symlinkNotPermitted(archivePath)
+            }
+        }
+        try writer.addSymbolicLink(
+            path: archivePath,
+            target: target,
+            modificationDate: modificationDate(at: url) ?? Date(),
+            permissions: posixPermissions(at: url) ?? 0o755
+        )
     }
 
     /// Streams one file into the writer chunk by chunk, reporting per-chunk

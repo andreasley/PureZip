@@ -18,6 +18,8 @@ public enum ZipError: Error, Equatable, CustomStringConvertible {
     case checksumMismatch(String)
     /// The entry path would escape the extraction directory or is otherwise dangerous.
     case unsafePath(String)
+    /// A symbolic link was rejected by the configured `ZipSymlinkPolicy`.
+    case symlinkNotPermitted(String)
     /// A configured security limit was exceeded (see `ZipSecurityLimits`).
     case limitExceeded(String)
     /// The path passed to the writer is not a valid relative archive path.
@@ -50,6 +52,8 @@ public enum ZipError: Error, Equatable, CustomStringConvertible {
             return "Checksum mismatch for entry '\(path)'."
         case .unsafePath(let path):
             return "Entry path '\(path)' is unsafe and was rejected."
+        case .symlinkNotPermitted(let path):
+            return "Symbolic link '\(path)' is not permitted by the symlink policy."
         case .limitExceeded(let detail):
             return "Security limit exceeded: \(detail)."
         case .invalidPath(let path):

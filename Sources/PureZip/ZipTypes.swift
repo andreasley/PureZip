@@ -23,6 +23,25 @@ public enum ZipCompressionMethod: Sendable, Equatable {
     }
 }
 
+/// How symbolic links are handled when compressing directory trees
+/// (`PureZip.zipItem`) and when extracting archives.
+public enum ZipSymlinkPolicy: Sendable, Equatable {
+    /// Throw `ZipError.symlinkNotPermitted` when a symbolic link is encountered.
+    case reject
+    /// Round-trip symbolic links whose targets are relative and stay
+    /// (lexically) inside the tree being compressed or the extraction
+    /// destination; throw `ZipError.symlinkNotPermitted` for absolute
+    /// targets or targets that escape. The default — it round-trips
+    /// self-contained trees like macOS framework bundles while refusing
+    /// links that reach outside them.
+    case confined
+    /// Round-trip all symbolic links verbatim, including absolute targets
+    /// and targets pointing outside the destination. Regular file entries
+    /// are still never written through a symlink that leads outside the
+    /// extraction destination.
+    case unrestricted
+}
+
 /// Limits that protect against malicious archives (ZIP bombs, resource
 /// exhaustion). They apply when opening an archive and when extracting.
 ///
@@ -36,15 +55,19 @@ public struct ZipSecurityLimits: Sendable {
     public var maxUncompressedEntrySize: UInt64
     /// Maximum total uncompressed size of all extracted entries, in bytes.
     public var maxTotalUncompressedSize: UInt64
+    /// How symbolic link entries are handled during extraction.
+    public var symlinkPolicy: ZipSymlinkPolicy
 
     public init(
         maxEntryCount: Int = 100_000,
         maxUncompressedEntrySize: UInt64 = 4 << 30,   // 4 GiB
-        maxTotalUncompressedSize: UInt64 = 16 << 30   // 16 GiB
+        maxTotalUncompressedSize: UInt64 = 16 << 30,  // 16 GiB
+        symlinkPolicy: ZipSymlinkPolicy = .confined
     ) {
         self.maxEntryCount = maxEntryCount
         self.maxUncompressedEntrySize = maxUncompressedEntrySize
         self.maxTotalUncompressedSize = maxTotalUncompressedSize
+        self.symlinkPolicy = symlinkPolicy
     }
 
     public static let `default` = ZipSecurityLimits()
@@ -56,7 +79,9 @@ public struct ZipEntry: Sendable, Hashable {
     public let path: String
     /// True if the entry represents a directory.
     public let isDirectory: Bool
-    /// True if the entry represents a symbolic link (never extracted to disk).
+    /// True if the entry represents a symbolic link; whether it is extracted
+    /// is governed by `ZipSymlinkPolicy`. The entry's contents are the link's
+    /// target path.
     public let isSymbolicLink: Bool
     /// Uncompressed size in bytes.
     public let uncompressedSize: UInt64
@@ -147,6 +172,30 @@ enum ZipPath {
         }
         guard !components.isEmpty else { return nil }
         return components.joined(separator: "/")
+    }
+
+    /// Whether a symbolic link target, resolved lexically against the link's
+    /// directory (given relative to the tree root), stays inside the tree.
+    ///
+    /// Absolute targets never qualify. The check is purely lexical: every
+    /// `..` must stay at or below the root. Links to other in-tree links
+    /// remain confined transitively because each link is checked against
+    /// the same rule.
+    static func symlinkTargetIsConfined(_ target: String, linkDirectory: String) -> Bool {
+        guard !target.isEmpty, !target.contains("\0"), !target.hasPrefix("/") else { return false }
+        var depth = linkDirectory.split(separator: "/", omittingEmptySubsequences: true)
+            .filter { $0 != "." }
+            .count
+        for component in target.split(separator: "/", omittingEmptySubsequences: true) {
+            if component == "." { continue }
+            if component == ".." {
+                depth -= 1
+                if depth < 0 { return false }
+            } else {
+                depth += 1
+            }
+        }
+        return true
     }
 
     /// Validates a path being added to an archive by the writer and returns

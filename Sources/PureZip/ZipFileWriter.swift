@@ -131,7 +131,37 @@ public final class ZipFileWriter {
         }
         try writeInMemoryEntry(
             normalizedPath: normalizedPath, data: data, crc: crc, method: method,
-            payload: payload, modificationDate: modificationDate, permissions: permissions
+            payload: payload, modificationDate: modificationDate,
+            externalAttributes: (UInt32(permissions & 0o7777) | 0o100000) << 16
+        )
+    }
+
+    /// Adds a symbolic link entry pointing at `target` (stored uncompressed).
+    ///
+    /// The target path is recorded verbatim as the entry's contents, with
+    /// Unix S_IFLNK external attributes. Policy enforcement
+    /// (`ZipSymlinkPolicy`) happens in `PureZip.zipItem` and on extraction,
+    /// not here — the caller of this low-level API decides what to record.
+    public func addSymbolicLink(
+        path: String,
+        target: String,
+        modificationDate: Date = Date(),
+        permissions: UInt16 = 0o755
+    ) throws {
+        try requireReady()
+        let normalizedPath = try ZipPath.normalizedArchivePath(path, isDirectory: false)
+        guard addedPaths.insert(normalizedPath).inserted else {
+            throw ZipError.duplicateEntry(normalizedPath)
+        }
+        guard !target.isEmpty, !target.contains("\0") else {
+            throw ZipError.invalidPath(target)
+        }
+        let targetData = Data(target.utf8)
+        try writeInMemoryEntry(
+            normalizedPath: normalizedPath, data: targetData,
+            crc: CRC32.checksum(targetData), method: 0, payload: nil,
+            modificationDate: modificationDate,
+            externalAttributes: (UInt32(permissions & 0o7777) | 0o120000) << 16
         )
     }
 
@@ -168,7 +198,8 @@ public final class ZipFileWriter {
         addedPaths.insert(normalizedPath)
         try writeInMemoryEntry(
             normalizedPath: normalizedPath, data: data, crc: crc, method: method,
-            payload: payload, modificationDate: modificationDate, permissions: permissions
+            payload: payload, modificationDate: modificationDate,
+            externalAttributes: (UInt32(permissions & 0o7777) | 0o100000) << 16
         )
         progress?(ZipProgress(
             completedBytes: UInt64(data.count), totalBytes: UInt64(data.count),
@@ -185,7 +216,7 @@ public final class ZipFileWriter {
         method: UInt16,
         payload: [UInt8]?,
         modificationDate: Date,
-        permissions: UInt16
+        externalAttributes: UInt32
     ) throws {
         let nameBytes = [UInt8](normalizedPath.utf8)
         guard nameBytes.count <= 0xFFFF else { throw ZipError.invalidPath(normalizedPath) }
@@ -193,7 +224,6 @@ public final class ZipFileWriter {
         let uncompressedSize = UInt64(data.count)
         let flags: UInt16 = normalizedPath.allSatisfy(\.isASCII) ? 0 : 0x0800
         let (dosTime, dosDate) = DOSDate.fields(from: modificationDate)
-        let externalAttributes = (UInt32(permissions & 0o7777) | 0o100000) << 16
         let needsZip64 = uncompressedSize >= 0xFFFF_FFFF || compressedSize >= 0xFFFF_FFFF
 
         let headerOffset = offset

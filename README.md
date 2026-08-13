@@ -12,6 +12,7 @@ A pure-Swift ZIP library — read, write, compress, and extract ZIP archives wit
 - **Automatic store fallback**: entries that don't shrink under DEFLATE are stored uncompressed
 - **Robust filename handling**: UTF-8 (flagged and unflagged), the Info-ZIP Unicode Path extra field, and CP437 fallback for legacy archives — plus an opt-in `legacyNameEncoding` for archives whose names use a system code page (Shift-JIS, Windows code pages, classic Mac OS encodings, ...)
 - **Metadata**: DOS timestamps and POSIX permissions round-trip through the archive
+- **Symlink round-tripping**: symbolic links are archived and recreated (macOS framework bundles zip and unzip intact), governed by a configurable `ZipSymlinkPolicy` — `reject`, `confined` (default: only links that stay inside the tree/destination), or `unrestricted`
 - **Three compression levels**: `.fastest`, `.normal`, `.maximum`
 - **Async API with progress and cancellation**: the high-level operations (`zipItem`, `unzipItem`, `extractAll`, `extract(_:to:)`) and async variants of the writers' `addFile` methods run off the caller's actor, report byte-level progress through a `@Sendable` callback, and stop on task cancellation
 - **Interoperable**: archives verify cleanly with Info-ZIP's `unzip -t`; archives from other tools (Info-ZIP, zlib streams) read correctly
@@ -22,7 +23,7 @@ Malicious or broken archives are treated as hostile input everywhere:
 
 - **ZIP bomb protection** — decompression is hard-capped at each entry's declared size, and configurable `ZipSecurityLimits` cap per-entry size, total extracted size, and entry count. Entries that lie about their sizes are rejected.
 - **Path traversal protection** — entry paths are sanitized (`..` components, NUL bytes, and drive designators are rejected; absolute paths and backslash separators are neutralized), and a resolved-path containment check prevents escapes through pre-existing symlinks. Extraction never writes outside the destination directory.
-- **No symlink extraction** — symbolic link entries are never created on disk.
+- **Symlink policy** — by default (`ZipSymlinkPolicy.confined`) only links whose targets stay inside the extraction destination are created; absolute or escaping targets throw. `reject` refuses symlinks entirely; `unrestricted` recreates them verbatim. Regular files are never written through a symlink that leads outside the destination, regardless of policy.
 - **Integrity checking** — every extracted entry is verified against its CRC-32 checksum and declared size.
 - **Safe parsing** — all archive parsing is bounds-checked; truncated, corrupted, or garbage input throws a `ZipError` instead of crashing.
 - **No surprise permissions** — set-uid/set-gid/sticky bits are stripped on extraction.
@@ -161,7 +162,6 @@ Run the suite yourself with `swift test -c release` (the `Performance` suite pri
 - **Streamed entries always use DEFLATE** — the store-vs-deflate size comparison only happens for in-memory `addFile(path:data:)`; streamed entries can't be retroactively stored (though incompressible data degrades gracefully to stored blocks inside the DEFLATE stream, costing only ~0.01%). Pass `compress: false` to store explicitly.
 - **No encryption** — neither legacy ZipCrypto nor AES; encrypted entries are rejected, never silently skipped.
 - **DEFLATE and Store only** — archives using bzip2, LZMA, Zstandard, etc. are refused with `.unsupportedCompressionMethod`.
-- **Symbolic links are skipped** on both compression and extraction (a deliberate security trade-off, but it means link-heavy trees don't round-trip).
 - **No multi-disk (spanned) archives**, and self-extracting archives with data prepended before the ZIP structure are not recognized.
 - **No archive editing** — an existing archive can't be appended to or repacked in place; build a new one instead.
 - **Compression ratio** is close to, but not quite, zlib's best; the encoder favors simplicity and speed over squeezing out the last percent.
@@ -171,7 +171,6 @@ Run the suite yourself with `swift test -c release` (the `Performance` suite pri
 - Streaming *input* for reading: open archives from a file handle without mapping, for pipes and network streams
 - AES-256 encryption and decryption (and read-only ZipCrypto support)
 - Appending to and updating existing archives
-- Optional symlink round-tripping behind an explicit opt-in flag
 - Zstandard / LZMA entry support
 - Multithreaded compression of independent entries
 - Extended timestamp (0x5455) and Unix extra fields for full-fidelity metadata
@@ -185,7 +184,7 @@ Run the suite yourself with `swift test -c release` (the `Performance` suite pri
 
 ## Testing
 
-96 test cases cover round trips across sizes, levels, and content types; streaming compression and extraction (chunked writes, cross-chunk matches, window sliding, partial-file cleanup); tricky filenames (emoji, CJK, combining accents, CP437, very long names); real-world fixtures created by Info-ZIP and zlib; verification of generated archives with the system `unzip`; and the full attack surface: traversal payloads, symlinks, ZIP bombs, lying size headers, flipped bytes, truncation, and garbage input.
+100 test cases cover round trips across sizes, levels, and content types; streaming compression and extraction (chunked writes, cross-chunk matches, window sliding, partial-file cleanup); tricky filenames (emoji, CJK, combining accents, CP437, very long names); real-world fixtures created by Info-ZIP and zlib; verification of generated archives with the system `unzip`; and the full attack surface: traversal payloads, symlinks, ZIP bombs, lying size headers, flipped bytes, truncation, and garbage input.
 
 ```sh
 swift test              # fast, debug

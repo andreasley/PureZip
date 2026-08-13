@@ -6,7 +6,8 @@ import Foundation
 /// entry data is located and decompressed on demand. Extraction validates
 /// every entry against its CRC-32 checksum and declared size, enforces
 /// `ZipSecurityLimits`, sanitizes paths (rejecting traversal attempts),
-/// and never creates symbolic links.
+/// and restricts symbolic links according to `ZipSymlinkPolicy` (by
+/// default only links confined to the extraction destination are created).
 public struct ZipArchive: Sendable {
     /// All entries listed in the central directory, in archive order.
     public let entries: [ZipEntry]
@@ -470,8 +471,15 @@ public struct ZipArchive: Sendable {
         completedBase: UInt64, totalBytes: UInt64,
         progress: ZipProgressHandler?
     ) throws {
-        guard !entry.isSymbolicLink else {
-            throw ZipError.unsupportedFeature("symbolic link entries are not extracted")
+        if entry.isSymbolicLink {
+            // For a single-entry extraction the confinement context is the
+            // entry's own location within the archive.
+            let linkDirectory = ZipPath.sanitizedRelativePath(entry.path)
+                .map { ($0 as NSString).deletingLastPathComponent } ?? ""
+            try createSymbolicLink(
+                entry, at: fileURL, linkDirectory: linkDirectory, overwrite: overwrite
+            )
+            return
         }
         if entry.isDirectory {
             try FileManager.default.createDirectory(at: fileURL, withIntermediateDirectories: true)
@@ -524,6 +532,41 @@ public struct ZipArchive: Sendable {
         }
     }
 
+    /// Creates the symbolic link stored in `entry` on disk, subject to
+    /// `limits.symlinkPolicy`. `linkDirectory` is the link's directory
+    /// relative to the extraction root, used for the confinement check.
+    private func createSymbolicLink(
+        _ entry: ZipEntry, at fileURL: URL, linkDirectory: String, overwrite: Bool
+    ) throws {
+        guard limits.symlinkPolicy != .reject else {
+            throw ZipError.symlinkNotPermitted(entry.path)
+        }
+        // The entry's contents are the link target; extractData verifies the
+        // CRC and enforces the entry-size limits.
+        guard entry.uncompressedSize <= 4096 else {
+            throw ZipError.corruptedData("symbolic link target of '\(entry.path)' is too long")
+        }
+        let targetData = try extractData(entry)
+        guard !targetData.isEmpty, !targetData.contains(0) else {
+            throw ZipError.corruptedData("invalid symbolic link target for '\(entry.path)'")
+        }
+        let target = String(decoding: targetData, as: UTF8.self)
+        if limits.symlinkPolicy == .confined {
+            guard ZipPath.symlinkTargetIsConfined(target, linkDirectory: linkDirectory) else {
+                throw ZipError.symlinkNotPermitted(entry.path)
+            }
+        }
+
+        let fileManager = FileManager.default
+        // attributesOfItem does not follow symlinks, so this also detects
+        // dangling links occupying the target path.
+        if (try? fileManager.attributesOfItem(atPath: fileURL.path)) != nil {
+            guard overwrite else { throw ZipError.destinationExists(fileURL.path) }
+            try fileManager.removeItem(at: fileURL)
+        }
+        try fileManager.createSymbolicLink(atPath: fileURL.path, withDestinationPath: target)
+    }
+
     /// Extracts all entries into `directory`, creating it if necessary.
     ///
     /// Runs off the caller's actor; cancelling the surrounding task stops the
@@ -531,9 +574,12 @@ public struct ZipArchive: Sendable {
     ///
     /// Security behavior:
     /// - Entry paths are sanitized; paths with `..` components throw `ZipError.unsafePath`.
-    /// - Symbolic link entries are skipped, never created.
-    /// - Files are never written through a pre-existing symlink that leads
-    ///   outside the destination.
+    /// - Symbolic link entries are handled according to `limits.symlinkPolicy`:
+    ///   with the default `.confined`, links whose targets stay inside the
+    ///   destination are recreated and anything else throws
+    ///   `ZipError.symlinkNotPermitted`.
+    /// - Files are never written through a symlink that leads outside the
+    ///   destination, regardless of the symlink policy.
     /// - Total decompressed output is capped by `limits.maxTotalUncompressedSize`.
     ///
     /// - Parameter progress: Called after each decompressed chunk with the
@@ -560,7 +606,6 @@ public struct ZipArchive: Sendable {
 
         for entry in entries {
             try Task.checkCancellation()
-            if entry.isSymbolicLink { continue }
 
             guard let relativePath = ZipPath.sanitizedRelativePath(entry.path) else {
                 throw ZipError.unsafePath(entry.path)
@@ -578,6 +623,18 @@ public struct ZipArchive: Sendable {
 
             if entry.isDirectory {
                 try fileManager.createDirectory(at: target, withIntermediateDirectories: true)
+                continue
+            }
+
+            if entry.isSymbolicLink {
+                try fileManager.createDirectory(
+                    at: target.deletingLastPathComponent(), withIntermediateDirectories: true
+                )
+                try createSymbolicLink(
+                    entry, at: target,
+                    linkDirectory: (relativePath as NSString).deletingLastPathComponent,
+                    overwrite: overwrite
+                )
                 continue
             }
 

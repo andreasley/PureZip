@@ -1,5 +1,26 @@
 import Foundation
 
+/// Bit-level input for the DEFLATE decoder: a complete in-memory buffer
+/// (`BitReader`) or an incrementally pulled stream (`StreamingBitReader`).
+protocol InflateBitSource {
+    /// Tops the accumulator up to at least 56 valid bits, zero-padding past
+    /// the end of input.
+    mutating func refill() throws
+    /// Returns the next `n` bits without consuming them (after `refill()`).
+    func peek(_ n: Int) -> Int
+    mutating func consume(_ n: Int)
+    /// True once more bits were consumed than the input contained.
+    var overran: Bool { get }
+    /// Reads `n` bits (n ≤ 32), throwing if the input is exhausted.
+    mutating func take(_ n: Int) throws -> Int
+    /// Skips forward to the next byte boundary of the underlying stream.
+    mutating func alignToByte() throws
+    /// Copies `n` raw bytes; the reader must be byte-aligned.
+    mutating func readBytes(to destination: UnsafeMutablePointer<UInt8>, count n: Int) throws
+}
+
+extension BitReader: InflateBitSource {}
+
 /// Destination for decompressed DEFLATE output.
 ///
 /// Implementations expose a contiguous buffer whose trailing bytes always
@@ -241,8 +262,28 @@ enum Inflate {
         }
     }
 
-    private static func decode<Output: InflateOutput>(
-        _ reader: inout BitReader, into output: inout Output
+    /// Decompresses a DEFLATE stream pulled incrementally from `source`,
+    /// delivering output as sequential chunks with constant memory usage.
+    /// Returns when the stream's final block ends; buffered read-ahead is
+    /// handed back to the source. Size caps are the caller's responsibility
+    /// (enforced inside `chunkHandler`), since streamed entries may not
+    /// declare their size upfront.
+    static func decompress(
+        from source: StreamByteSource,
+        chunkHandler: (UnsafeRawBufferPointer) throws -> Void
+    ) throws {
+        try withoutActuallyEscaping(chunkHandler) { handler in
+            var output = WindowedOutputBuffer(limit: .max, sink: handler)
+            defer { output.destroy() }
+            var reader = StreamingBitReader(source: source)
+            try decode(&reader, into: &output)
+            try reader.finish()
+            try output.drain(keeping: 0)
+        }
+    }
+
+    private static func decode<Reader: InflateBitSource, Output: InflateOutput>(
+        _ reader: inout Reader, into output: inout Output
     ) throws {
         while true {
             let isFinal = try reader.take(1) == 1
@@ -263,8 +304,8 @@ enum Inflate {
         }
     }
 
-    private static func copyStoredBlock<Output: InflateOutput>(
-        _ reader: inout BitReader, into output: inout Output
+    private static func copyStoredBlock<Reader: InflateBitSource, Output: InflateOutput>(
+        _ reader: inout Reader, into output: inout Output
     ) throws {
         try reader.alignToByte()
         let length = try reader.take(16)
@@ -278,7 +319,9 @@ enum Inflate {
     }
 
     /// Reads the compressed Huffman code descriptions of a dynamic block.
-    private static func readDynamicTables(_ reader: inout BitReader) throws -> (Table, Table) {
+    private static func readDynamicTables<Reader: InflateBitSource>(
+        _ reader: inout Reader
+    ) throws -> (Table, Table) {
         let literalCount = try reader.take(5) + 257
         let distanceCount = try reader.take(5) + 1
         let codeLengthCount = try reader.take(4) + 4
@@ -332,8 +375,10 @@ enum Inflate {
     }
 
     @inline(__always)
-    private static func decodeSymbol(_ reader: inout BitReader, _ table: Table) throws -> Int {
-        reader.refill()
+    private static func decodeSymbol<Reader: InflateBitSource>(
+        _ reader: inout Reader, _ table: Table
+    ) throws -> Int {
+        try reader.refill()
         let entry = table.entries[reader.peek(table.maxBits)]
         guard entry != 0 else { throw ZipError.corruptedData("invalid Huffman code") }
         reader.consume(Int(entry >> 10))
@@ -342,8 +387,8 @@ enum Inflate {
     }
 
     /// The hot loop: decodes one compressed block's literal/match stream.
-    private static func decodeBlock<Output: InflateOutput>(
-        _ reader: inout BitReader,
+    private static func decodeBlock<Reader: InflateBitSource, Output: InflateOutput>(
+        _ reader: inout Reader,
         into output: inout Output,
         literals: Table,
         distances: Table
@@ -355,7 +400,7 @@ enum Inflate {
             let distanceEntries = distances.entries
 
             while true {
-                reader.refill()
+                try reader.refill()
                 if reader.overran { throw ZipError.truncatedData }
 
                 let literalEntry = literalEntries[reader.peek(literalMaxBits)]

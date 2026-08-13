@@ -7,6 +7,7 @@ A pure-Swift ZIP library — read, write, compress, and extract ZIP archives wit
 - **Read and write ZIP archives**, in memory or on disk
 - **Compress files and folders** to `.zip`, extract archives to a directory
 - **Streaming compression and extraction** with constant memory usage: `ZipFileWriter` compresses entries chunk by chunk straight to disk (including push-style entries of unknown size), and `ZipArchive` extracts entries of any size through a fixed ~96 KiB window — `zipItem`/`unzipItem` use these automatically
+- **Streaming input**: `ZipStreamReader` reads archives strictly sequentially from a pipe, socket, or download — no seeking, no mapping — including data-descriptor entries as written by streaming producers (Info-ZIP `zip -`, Java, etc.)
 - **Pure Swift DEFLATE** (RFC 1951): LZ77 hash-chain matching with lazy evaluation; per-block selection between dynamic Huffman, fixed Huffman, and stored encoding, so output never balloons
 - **ZIP64 support**: large sizes/offsets and more than 65,535 entries
 - **Automatic store fallback**: entries that don't shrink under DEFLATE are stored uncompressed
@@ -108,6 +109,25 @@ try archive.extract(entry) { chunk in
 }
 ```
 
+### Read an archive from a stream (pipe, socket, download)
+
+```swift
+// Strictly sequential: no seeking, no mapping. CRC-verified per entry.
+let reader = ZipStreamReader(fileHandle: pipe.fileHandleForReading)
+while let entry = try reader.nextEntry() {
+    guard !entry.isDirectory else { continue }
+    print(entry.path, entry.declaredUncompressedSize ?? "size unknown until read")
+    try reader.readEntry { chunk in
+        // decompressed bytes, delivered as they arrive
+    }
+}
+```
+
+Because the central directory at the end of the archive is never reached,
+central-directory-only metadata (POSIX permissions, symlink flags) is not
+available, and entry paths are reported unsanitized. Prefer `ZipArchive`
+whenever the input is a file.
+
 ### Tighten (or relax) the security limits
 
 ```swift
@@ -158,7 +178,7 @@ Run the suite yourself with `swift test -c release` (the `Performance` suite pri
 
 ## Drawbacks and limitations
 
-- **Reading maps the whole archive** — `ZipArchive` works on a (memory-mapped) `Data` of the archive; extraction output streams with constant memory, but the compressed input must be a seekable file or fit in memory. Streamed *writing* has no such constraint.
+- **`ZipArchive` maps the whole archive** — it works on a (memory-mapped) `Data` of the archive, so the compressed input must be a seekable file or fit in memory. `ZipStreamReader` reads sequentially without mapping, but cannot see central-directory metadata (permissions, symlink flags) and cannot stream *stored* entries that use data descriptors (their length is unmarked).
 - **Streamed entries always use DEFLATE** — the store-vs-deflate size comparison only happens for in-memory `addFile(path:data:)`; streamed entries can't be retroactively stored (though incompressible data degrades gracefully to stored blocks inside the DEFLATE stream, costing only ~0.01%). Pass `compress: false` to store explicitly.
 - **No encryption** — neither legacy ZipCrypto nor AES; encrypted entries are rejected, never silently skipped.
 - **DEFLATE and Store only** — archives using bzip2, LZMA, Zstandard, etc. are refused with `.unsupportedCompressionMethod`.
@@ -168,7 +188,6 @@ Run the suite yourself with `swift test -c release` (the `Performance` suite pri
 
 ## Possible future features
 
-- Streaming *input* for reading: open archives from a file handle without mapping, for pipes and network streams
 - AES-256 encryption and decryption (and read-only ZipCrypto support)
 - Appending to and updating existing archives
 - Zstandard / LZMA entry support
@@ -184,7 +203,7 @@ Run the suite yourself with `swift test -c release` (the `Performance` suite pri
 
 ## Testing
 
-100 test cases cover round trips across sizes, levels, and content types; streaming compression and extraction (chunked writes, cross-chunk matches, window sliding, partial-file cleanup); tricky filenames (emoji, CJK, combining accents, CP437, very long names); real-world fixtures created by Info-ZIP and zlib; verification of generated archives with the system `unzip`; and the full attack surface: traversal payloads, symlinks, ZIP bombs, lying size headers, flipped bytes, truncation, and garbage input.
+107 test cases cover round trips across sizes, levels, and content types; streaming compression and extraction (chunked writes, cross-chunk matches, window sliding, partial-file cleanup); tricky filenames (emoji, CJK, combining accents, CP437, very long names); real-world fixtures created by Info-ZIP and zlib; verification of generated archives with the system `unzip`; and the full attack surface: traversal payloads, symlinks, ZIP bombs, lying size headers, flipped bytes, truncation, and garbage input.
 
 ```sh
 swift test              # fast, debug

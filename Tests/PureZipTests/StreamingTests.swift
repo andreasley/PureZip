@@ -327,3 +327,241 @@ struct StreamingTests {
         }
     }
 }
+
+// MARK: - Streaming input
+
+@Suite("Streaming input")
+struct StreamInputTests {
+    /// A pull closure that serves `bytes` in fixed-size chunks.
+    private func chunkedSource(_ bytes: [UInt8], chunkSize: Int) -> () throws -> Data? {
+        var offset = 0
+        return {
+            guard offset < bytes.count else { return nil }
+            let end = min(offset + chunkSize, bytes.count)
+            defer { offset = end }
+            return Data(bytes[offset..<end])
+        }
+    }
+
+    /// A local-header entry with a data descriptor, as streamed producers
+    /// write them (sizes unknown at header time).
+    private func descriptorEntryBytes(
+        name: String, payload: Data, withSignature: Bool
+    ) -> [UInt8] {
+        let compressed = Deflate.compress(payload)
+        var out: [UInt8] = []
+        out.appendLE32(0x0403_4B50)
+        out.appendLE16(20)
+        out.appendLE16(0x0008) // sizes follow in a data descriptor
+        out.appendLE16(8) // deflate
+        out.appendLE16(0)
+        out.appendLE16(0x21)
+        out.appendLE32(0) // crc unknown
+        out.appendLE32(0) // compressed size unknown
+        out.appendLE32(0) // uncompressed size unknown
+        out.appendLE16(name.utf8.count)
+        out.appendLE16(0)
+        out.append(contentsOf: [UInt8](name.utf8))
+        out.append(contentsOf: compressed)
+        if withSignature { out.appendLE32(0x0807_4B50) }
+        out.appendLE32(CRC32.checksum(payload))
+        out.appendLE32(UInt32(compressed.count))
+        out.appendLE32(UInt32(payload.count))
+        return out
+    }
+
+    /// A plain local-header entry with known sizes (no data descriptor).
+    private func plainEntryBytes(name: String, payload: Data) -> [UInt8] {
+        let compressed = Deflate.compress(payload)
+        var out: [UInt8] = []
+        out.appendLE32(0x0403_4B50)
+        out.appendLE16(20)
+        out.appendLE16(0)
+        out.appendLE16(8) // deflate
+        out.appendLE16(0)
+        out.appendLE16(0x21)
+        out.appendLE32(CRC32.checksum(payload))
+        out.appendLE32(UInt32(compressed.count))
+        out.appendLE32(UInt32(payload.count))
+        out.appendLE16(name.utf8.count)
+        out.appendLE16(0)
+        out.append(contentsOf: [UInt8](name.utf8))
+        out.append(contentsOf: compressed)
+        return out
+    }
+
+    /// Marks the end of the entry data (start of the central directory).
+    private let centralDirectoryMarker: [UInt8] = [0x50, 0x4B, 0x01, 0x02]
+
+    @Test func roundTripFromChunkedStream() throws {
+        let writer = ZipWriter()
+        let text = Data(String(repeating: "streaming input ", count: 20_000).utf8)
+        let noise = randomData(count: 300_000, seed: 401)
+        try writer.addDirectory(path: "docs")
+        try writer.addFile(path: "docs/tëxt.txt", data: text)
+        try writer.addFile(path: "noise.bin", data: noise) // stored
+        try writer.addFile(path: "empty.dat", data: Data())
+        let bytes = [UInt8](writer.finalize())
+
+        // Tiny chunks stress the buffering across every header boundary.
+        let reader = ZipStreamReader(readChunk: chunkedSource(bytes, chunkSize: 7))
+
+        let directory = try #require(try reader.nextEntry())
+        #expect(directory.path == "docs/")
+        #expect(directory.isDirectory)
+
+        let textEntry = try #require(try reader.nextEntry())
+        #expect(textEntry.path == "docs/tëxt.txt")
+        #expect(textEntry.declaredUncompressedSize == UInt64(text.count))
+        #expect(textEntry.compressionMethod == .deflate)
+        var collected = Data()
+        var chunkCount = 0
+        let summary = try reader.readEntry { chunk in
+            collected.append(chunk)
+            chunkCount += 1
+        }
+        #expect(collected == text)
+        #expect(chunkCount > 1, "large entries should arrive in multiple chunks")
+        #expect(summary.uncompressedSize == UInt64(text.count))
+        #expect(summary.crc32 == CRC32.checksum(text))
+
+        let noiseEntry = try #require(try reader.nextEntry())
+        #expect(noiseEntry.compressionMethod == .store)
+        #expect(try reader.readEntryData() == noise)
+
+        let empty = try #require(try reader.nextEntry())
+        #expect(empty.path == "empty.dat")
+        #expect(try reader.readEntryData() == Data())
+
+        #expect(try reader.nextEntry() == nil)
+        #expect(try reader.nextEntry() == nil, "the reader stays finished")
+    }
+
+    @Test func dataDescriptorEntriesAreStreamed() throws {
+        let first = mixedData(count: 200_000, seed: 402)
+        let second = Data("small descriptor entry".utf8)
+        var bytes = descriptorEntryBytes(name: "first.bin", payload: first, withSignature: true)
+        bytes += descriptorEntryBytes(name: "second.txt", payload: second, withSignature: false)
+        bytes += centralDirectoryMarker
+
+        let reader = ZipStreamReader(readChunk: chunkedSource(bytes, chunkSize: 1013))
+
+        let firstEntry = try #require(try reader.nextEntry())
+        #expect(firstEntry.path == "first.bin")
+        #expect(firstEntry.declaredUncompressedSize == nil, "size is unknown until read")
+        #expect(try reader.readEntryData() == first)
+
+        let secondEntry = try #require(try reader.nextEntry())
+        #expect(secondEntry.path == "second.txt")
+        #expect(try reader.readEntryData() == second)
+
+        #expect(try reader.nextEntry() == nil)
+    }
+
+    @Test func skippingUnreadEntriesWorks() throws {
+        let skippedPlain = mixedData(count: 100_000, seed: 403)
+        let skippedDescriptor = mixedData(count: 100_000, seed: 404)
+        let wanted = Data("the one we want".utf8)
+
+        var bytes = plainEntryBytes(name: "skip-plain.bin", payload: skippedPlain)
+        bytes += descriptorEntryBytes(name: "skip-desc.bin", payload: skippedDescriptor, withSignature: true)
+        bytes += descriptorEntryBytes(name: "wanted.txt", payload: wanted, withSignature: true)
+        bytes += centralDirectoryMarker
+
+        let reader = ZipStreamReader(readChunk: chunkedSource(bytes, chunkSize: 4096))
+        #expect(try reader.nextEntry()?.path == "skip-plain.bin")
+        #expect(try reader.nextEntry()?.path == "skip-desc.bin")
+        #expect(try reader.nextEntry()?.path == "wanted.txt")
+        #expect(try reader.readEntryData() == wanted)
+        #expect(try reader.nextEntry() == nil)
+    }
+
+    @Test func truncatedStreamFailsAndPoisonsReader() throws {
+        let writer = ZipWriter()
+        try writer.addFile(path: "a.bin", data: mixedData(count: 100_000, seed: 405))
+        // Cut off in the middle of the entry's compressed data.
+        let bytes = [UInt8](writer.finalize().prefix(10_000))
+
+        let reader = ZipStreamReader(readChunk: chunkedSource(bytes, chunkSize: 4096))
+        _ = try #require(try reader.nextEntry())
+        #expect(throws: ZipError.self) {
+            try reader.readEntry { _ in }
+        }
+        #expect(throws: ZipError.invalidState("the reader is unusable after a previous error")) {
+            _ = try reader.nextEntry()
+        }
+    }
+
+    @Test func streamReaderEnforcesEntrySizeLimit() throws {
+        let writer = ZipWriter()
+        try writer.addFile(path: "zeros.bin", data: Data(count: 600_000))
+        let bytes = [UInt8](writer.finalize())
+
+        let limits = ZipSecurityLimits(maxUncompressedEntrySize: 100_000)
+        let reader = ZipStreamReader(limits: limits, readChunk: chunkedSource(bytes, chunkSize: 4096))
+        _ = try #require(try reader.nextEntry())
+        #expect(throws: ZipError.self) {
+            try reader.readEntry { _ in }
+        }
+    }
+
+    @Test func readsZipFileWriterArchiveFromFileHandle() throws {
+        // ZipFileWriter's push-style entries use ZIP64 size placeholders in
+        // the local header; the streaming reader must pick the patched sizes
+        // out of the extra field.
+        try withTemporaryDirectory { directory in
+            let archiveURL = directory.appendingPathComponent("streamed.zip")
+            let writer = try ZipFileWriter(url: archiveURL)
+            let pushed = mixedData(count: 500_000, seed: 406)
+            try writer.addFile(path: "pushed.bin") { stream in
+                try stream.write(pushed)
+            }
+            try writer.addFile(path: "plain.txt", data: Data("plain".utf8))
+            try writer.finalize()
+
+            let handle = try FileHandle(forReadingFrom: archiveURL)
+            defer { try? handle.close() }
+            let reader = ZipStreamReader(fileHandle: handle)
+            let first = try #require(try reader.nextEntry())
+            #expect(first.path == "pushed.bin")
+            #expect(try reader.readEntryData() == pushed)
+            let second = try #require(try reader.nextEntry())
+            #expect(second.path == "plain.txt")
+            #expect(try reader.readEntryData() == Data("plain".utf8))
+            #expect(try reader.nextEntry() == nil)
+        }
+    }
+
+    #if os(macOS)
+    @Test func readsInfoZipStreamedOutputThroughPipe() throws {
+        // `zip -` writes a streaming archive (data descriptors) to stdout —
+        // read it live from the pipe, never touching a seekable file.
+        let zipPath = "/usr/bin/zip"
+        guard FileManager.default.isExecutableFile(atPath: zipPath) else { return }
+
+        try withTemporaryDirectory { directory in
+            let payload = mixedData(count: 400_000, seed: 407)
+            let fileURL = directory.appendingPathComponent("payload.bin")
+            try payload.write(to: fileURL)
+
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: zipPath)
+            process.currentDirectoryURL = directory
+            process.arguments = ["-q", "-", "payload.bin"]
+            let stdout = Pipe()
+            process.standardOutput = stdout
+            process.standardError = Pipe()
+            try process.run()
+
+            let reader = ZipStreamReader(fileHandle: stdout.fileHandleForReading)
+            let entry = try #require(try reader.nextEntry())
+            #expect(entry.path == "payload.bin")
+            #expect(try reader.readEntryData() == payload)
+            #expect(try reader.nextEntry() == nil)
+
+            process.waitUntilExit()
+            #expect(process.terminationStatus == 0)
+        }
+    }
+    #endif
+}

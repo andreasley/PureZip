@@ -10,7 +10,7 @@ A pure-Swift ZIP library — read, write, compress, and extract ZIP archives wit
 - **Pure Swift DEFLATE** (RFC 1951): LZ77 hash-chain matching with lazy evaluation; per-block selection between dynamic Huffman, fixed Huffman, and stored encoding, so output never balloons
 - **ZIP64 support**: large sizes/offsets and more than 65,535 entries
 - **Automatic store fallback**: entries that don't shrink under DEFLATE are stored uncompressed
-- **Robust filename handling**: UTF-8 (flagged and unflagged), the Info-ZIP Unicode Path extra field, and CP437 fallback for legacy archives
+- **Robust filename handling**: UTF-8 (flagged and unflagged), the Info-ZIP Unicode Path extra field, and CP437 fallback for legacy archives — plus an opt-in `legacyNameEncoding` for archives whose names use a system code page (Shift-JIS, Windows code pages, classic Mac OS encodings, ...)
 - **Metadata**: DOS timestamps and POSIX permissions round-trip through the archive
 - **Three compression levels**: `.fastest`, `.normal`, `.maximum`
 - **Async high-level API**: `zipItem`, `unzipItem`, `extractAll`, and `extract(_:to:)` are `async`, run off the caller's actor, report byte-level progress through a `@Sendable` callback, and stop on task cancellation
@@ -112,6 +112,25 @@ let archive = try ZipArchive(url: archiveURL, limits: limits)
 
 Defaults: 100,000 entries, 4 GiB per entry, 16 GiB total.
 
+### Read archives with legacy filename encodings
+
+Entry names declared as UTF-8 (or valid UTF-8) are always decoded as UTF-8.
+For older archives whose names were written in a system code page, pass the
+expected encoding; it is used only when a name is not valid UTF-8, with CP437
+(the ZIP specification's default) as the final fallback:
+
+```swift
+// From Japanese Windows:
+let archive = try ZipArchive(url: archiveURL, legacyNameEncoding: .shiftJIS)
+
+// From classic Mac OS — Foundation's .macOSRoman, or one of the
+// script-specific variants PureZip adds (.macOSJapanese, .macOSCyrillic,
+// .macOSChineseTraditional, .macOSGreek, ...):
+try await PureZip.unzipItem(
+    at: archiveURL, to: destinationURL, legacyNameEncoding: .macOSJapanese
+)
+```
+
 ### Error handling
 
 All failures throw `ZipError`, an `Equatable` enum with descriptive cases such as `.notAZipFile`, `.corruptedData`, `.checksumMismatch`, `.unsafePath`, `.limitExceeded`, and `.encryptedEntryUnsupported`.
@@ -159,7 +178,7 @@ Run the suite yourself with `swift test -c release` (the `Performance` suite pri
 
 ## Testing
 
-88 test cases cover round trips across sizes, levels, and content types; streaming compression and extraction (chunked writes, cross-chunk matches, window sliding, partial-file cleanup); tricky filenames (emoji, CJK, combining accents, CP437, very long names); real-world fixtures created by Info-ZIP and zlib; verification of generated archives with the system `unzip`; and the full attack surface: traversal payloads, symlinks, ZIP bombs, lying size headers, flipped bytes, truncation, and garbage input.
+92 test cases cover round trips across sizes, levels, and content types; streaming compression and extraction (chunked writes, cross-chunk matches, window sliding, partial-file cleanup); tricky filenames (emoji, CJK, combining accents, CP437, very long names); real-world fixtures created by Info-ZIP and zlib; verification of generated archives with the system `unzip`; and the full attack surface: traversal payloads, symlinks, ZIP bombs, lying size headers, flipped bytes, truncation, and garbage input.
 
 ```sh
 swift test              # fast, debug

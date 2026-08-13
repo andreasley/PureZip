@@ -12,6 +12,8 @@ public struct ZipArchive: Sendable {
     public let entries: [ZipEntry]
     /// The security limits this archive was opened with.
     public let limits: ZipSecurityLimits
+    /// The fallback encoding for legacy (non-UTF-8) entry names, if any.
+    public let legacyNameEncoding: String.Encoding?
 
     private let data: Data
     private let entryIndexByPath: [String: Int]
@@ -27,22 +29,45 @@ public struct ZipArchive: Sendable {
     // MARK: - Initialization
 
     /// Opens a ZIP archive from a file, memory-mapping it when possible.
-    public init(url: URL, limits: ZipSecurityLimits = .default) throws {
+    ///
+    /// - Parameter legacyNameEncoding: Fallback encoding for entry names that
+    ///   are neither declared as UTF-8 (via the EFS flag or a Unicode Path
+    ///   extra field) nor valid UTF-8. Use this for archives created by tools
+    ///   that wrote names in a system code page — e.g. `.shiftJIS` for
+    ///   Japanese Windows, `.windowsCP1251` for Cyrillic Windows, or
+    ///   `.macOSRoman`/`.macOSJapanese` for classic Mac OS. When `nil`
+    ///   (the default) or when the bytes don't decode, CP437 — the encoding
+    ///   the ZIP specification prescribes — is used.
+    public init(
+        url: URL,
+        limits: ZipSecurityLimits = .default,
+        legacyNameEncoding: String.Encoding? = nil
+    ) throws {
         let data: Data
         do {
             data = try Data(contentsOf: url, options: .mappedIfSafe)
         } catch {
             throw ZipError.notAZipFile
         }
-        try self.init(data: data, limits: limits)
+        try self.init(data: data, limits: limits, legacyNameEncoding: legacyNameEncoding)
     }
 
     /// Opens a ZIP archive from in-memory data.
-    public init(data: Data, limits: ZipSecurityLimits = .default) throws {
+    ///
+    /// See `init(url:limits:legacyNameEncoding:)` for the meaning of
+    /// `legacyNameEncoding`.
+    public init(
+        data: Data,
+        limits: ZipSecurityLimits = .default,
+        legacyNameEncoding: String.Encoding? = nil
+    ) throws {
         self.data = data
         self.limits = limits
+        self.legacyNameEncoding = legacyNameEncoding
         self.entries = try data.withUnsafeBytes { buffer in
-            try Self.parseCentralDirectory(buffer, limits: limits)
+            try Self.parseCentralDirectory(
+                buffer, limits: limits, legacyNameEncoding: legacyNameEncoding
+            )
         }
         var indexByPath: [String: Int] = [:]
         indexByPath.reserveCapacity(entries.count)
@@ -60,7 +85,9 @@ public struct ZipArchive: Sendable {
     // MARK: - Central directory parsing
 
     private static func parseCentralDirectory(
-        _ buffer: UnsafeRawBufferPointer, limits: ZipSecurityLimits
+        _ buffer: UnsafeRawBufferPointer,
+        limits: ZipSecurityLimits,
+        legacyNameEncoding: String.Encoding?
     ) throws -> [ZipEntry] {
         guard buffer.count >= 22 else { throw ZipError.notAZipFile }
 
@@ -152,14 +179,18 @@ public struct ZipArchive: Sendable {
         let directoryEnd = Int(centralDirectoryOffset + centralDirectorySize)
 
         for _ in 0..<totalEntries {
-            let entry = try parseCentralDirectoryRecord(buffer, offset: &offset, end: directoryEnd)
+            let entry = try parseCentralDirectoryRecord(
+                buffer, offset: &offset, end: directoryEnd,
+                legacyNameEncoding: legacyNameEncoding
+            )
             entries.append(entry)
         }
         return entries
     }
 
     private static func parseCentralDirectoryRecord(
-        _ buffer: UnsafeRawBufferPointer, offset: inout Int, end: Int
+        _ buffer: UnsafeRawBufferPointer, offset: inout Int, end: Int,
+        legacyNameEncoding: String.Encoding?
     ) throws -> ZipEntry {
         guard offset + 46 <= end else { throw ZipError.truncatedData }
         func u16(_ at: Int) -> UInt16 { buffer.loadUnaligned(fromByteOffset: offset + at, as: UInt16.self).littleEndian }
@@ -236,16 +267,23 @@ public struct ZipArchive: Sendable {
             throw ZipError.unsupportedFeature("multi-disk archive")
         }
 
-        // Decode the entry name: UTF-8 if flagged (or if a valid Unicode Path
-        // extra field is present), CP437 otherwise — with a lenient fallback
-        // for the many archivers that write unflagged UTF-8.
+        // Decode the entry name. Precedence: a valid Unicode Path extra field,
+        // then the EFS flag (both authoritative UTF-8 signals), then a lenient
+        // UTF-8 attempt (many archivers write unflagged UTF-8, and valid UTF-8
+        // is almost never a coincidence), then the caller's legacy encoding,
+        // and finally CP437 — the default the ZIP specification prescribes.
         let path: String
         if let unicodePathName {
             path = unicodePathName
         } else if flags & 0x0800 != 0 {
             path = String(decoding: nameBytes, as: UTF8.self)
+        } else if let utf8Path = String(bytes: nameBytes, encoding: .utf8) {
+            path = utf8Path
+        } else if let legacyNameEncoding,
+                  let legacyPath = String(bytes: nameBytes, encoding: legacyNameEncoding) {
+            path = legacyPath
         } else {
-            path = String(bytes: nameBytes, encoding: .utf8) ?? CP437.decode(nameBytes)
+            path = CP437.decode(nameBytes)
         }
 
         let madeByUnix = (versionMadeBy >> 8) == 3

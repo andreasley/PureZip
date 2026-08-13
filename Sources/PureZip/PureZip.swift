@@ -85,16 +85,21 @@ public enum PureZip {
     ///
     /// Runs off the caller's actor and supports task cancellation. See
     /// `ZipArchive.extractAll(to:overwrite:progress:)` for the security
-    /// guarantees and progress semantics.
+    /// guarantees and progress semantics, and
+    /// `ZipArchive.init(url:limits:legacyNameEncoding:)` for the meaning of
+    /// `legacyNameEncoding`.
     @concurrent
     public static func unzipItem(
         at sourceURL: URL,
         to destinationURL: URL,
         limits: ZipSecurityLimits = .default,
+        legacyNameEncoding: String.Encoding? = nil,
         overwrite: Bool = false,
         progress: ZipProgressHandler? = nil
     ) async throws {
-        let archive = try ZipArchive(url: sourceURL, limits: limits)
+        let archive = try ZipArchive(
+            url: sourceURL, limits: limits, legacyNameEncoding: legacyNameEncoding
+        )
         try await archive.extractAll(to: destinationURL, overwrite: overwrite, progress: progress)
     }
 

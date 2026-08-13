@@ -216,6 +216,66 @@ struct FilenameTests {
         #expect(archive.entries.first?.path == "ünflagged.txt")
     }
 
+    @Test func legacyNameEncodingDecodesSystemCodePages() throws {
+        // Shift-JIS names (Japanese Windows) are invalid as UTF-8 and come out
+        // as CP437 mojibake unless the caller provides the encoding.
+        let japaneseName = "日本語ファイル.txt"
+        let shiftJISBytes = [UInt8](try #require(japaneseName.data(using: .shiftJIS)))
+        let data = buildRawZip([.stored(nameBytes: shiftJISBytes, content: [1])])
+
+        let withoutHint = try ZipArchive(data: data)
+        #expect(withoutHint.entries.first?.path != japaneseName)
+
+        let archive = try ZipArchive(data: data, legacyNameEncoding: .shiftJIS)
+        #expect(archive.entries.first?.path == japaneseName)
+        #expect(archive.legacyNameEncoding == .shiftJIS)
+        #expect(try archive.extractData(at: japaneseName) == Data([1]))
+    }
+
+    @Test func legacyNameEncodingSupportsClassicMacOS() throws {
+        let romanName = "héllo wörld.txt"
+        let romanBytes = [UInt8](try #require(romanName.data(using: .macOSRoman)))
+        let roman = try ZipArchive(
+            data: buildRawZip([.stored(nameBytes: romanBytes, content: [1])]),
+            legacyNameEncoding: .macOSRoman
+        )
+        #expect(roman.entries.first?.path == romanName)
+
+        let japaneseName = "日本語ファイル.txt"
+        let macJapaneseBytes = [UInt8](try #require(japaneseName.data(using: .macOSJapanese)))
+        let macJapanese = try ZipArchive(
+            data: buildRawZip([.stored(nameBytes: macJapaneseBytes, content: [1])]),
+            legacyNameEncoding: .macOSJapanese
+        )
+        #expect(macJapanese.entries.first?.path == japaneseName)
+
+        let cyrillicName = "файл данных.bin"
+        let cyrillicBytes = [UInt8](try #require(cyrillicName.data(using: .macOSCyrillic)))
+        let cyrillic = try ZipArchive(
+            data: buildRawZip([.stored(nameBytes: cyrillicBytes, content: [1])]),
+            legacyNameEncoding: .macOSCyrillic
+        )
+        #expect(cyrillic.entries.first?.path == cyrillicName)
+    }
+
+    @Test func legacyNameEncodingRespectsPrecedence() throws {
+        // Valid (unflagged) UTF-8 must still decode as UTF-8 even when a
+        // legacy encoding is provided.
+        let utf8 = try ZipArchive(
+            data: buildRawZip([.stored(nameBytes: [UInt8]("ünflagged.txt".utf8), content: [7])]),
+            legacyNameEncoding: .shiftJIS
+        )
+        #expect(utf8.entries.first?.path == "ünflagged.txt")
+
+        // 0x82 is a Shift-JIS lead byte but 0x2E is not a valid trail byte;
+        // when the legacy encoding cannot decode the bytes, CP437 applies.
+        let cp437 = try ZipArchive(
+            data: buildRawZip([.stored(nameBytes: [0x82, 0x2E, 0x74, 0x78, 0x74], content: [1])]),
+            legacyNameEncoding: .shiftJIS
+        )
+        #expect(cp437.entries.first?.path == "é.txt")
+    }
+
     @Test func backslashSeparatorsAreTreatedAsPathSeparators() async throws {
         let data = buildRawZip([.stored(name: "dir\\sub\\file.txt", content: [UInt8]("x".utf8))])
         let archive = try ZipArchive(data: data)

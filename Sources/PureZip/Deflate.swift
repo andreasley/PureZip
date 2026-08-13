@@ -605,7 +605,7 @@ final class DeflateEncoder {
         guard target > processed else { return }
         // Move state into uniquely-referenced locals: keeps the hot loop free
         // of class-property and copy-on-write overhead.
-        var window = self.window; self.window = []
+        let window = self.window; self.window = []
         var head = self.head; self.head = []
         var previous = self.previous; self.previous = []
         var tokens = self.tokens; self.tokens = []

@@ -344,7 +344,7 @@ struct SecurityTests {
         // Three highly compressible entries; the total exceeds the configured cap.
         let writer = ZipWriter()
         for i in 0..<3 {
-            try writer.addFile(path: "zeros\(i).bin", data: Data(count: 600_000))
+            try await writer.addFile(path: "zeros\(i).bin", data: Data(count: 600_000))
         }
         let data = writer.finalize()
         #expect(data.count < 20_000, "the bomb itself must be small")
@@ -541,7 +541,7 @@ struct FileSystemTests {
     @Test func overwriteBehavior() async throws {
         try await withTemporaryDirectory { directory in
             let writer = ZipWriter()
-            try writer.addFile(path: "f.txt", data: Data("v1".utf8))
+            try await writer.addFile(path: "f.txt", data: Data("v1".utf8))
             let archive = try ZipArchive(data: writer.finalize())
             try await archive.extractAll(to: directory)
             await #expect(throws: ZipError.self) { try await archive.extractAll(to: directory) }

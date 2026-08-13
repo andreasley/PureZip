@@ -102,6 +102,46 @@ enum Deflate {
         return encoder.takeOutput()
     }
 
+    /// Computes the CRC-32 of `data` and, when `compress` is set, compresses
+    /// it — working in ~512 KiB chunks so the surrounding task can cancel the
+    /// work and observe progress. Used by the async writer APIs.
+    ///
+    /// Returns `compressed: nil` when `compress` is `false` or `data` is
+    /// empty; callers decide between Store and DEFLATE from the sizes.
+    static func checksumAndCompress(
+        _ data: Data,
+        level: CompressionLevel,
+        compress: Bool,
+        path: String,
+        progress: ZipProgressHandler?
+    ) throws -> (crc: UInt32, compressed: [UInt8]?) {
+        let totalBytes = UInt64(data.count)
+        var crc: UInt32 = 0
+        let encoder = (compress && !data.isEmpty) ? DeflateEncoder(level: level) : nil
+        var output: [UInt8] = []
+        try data.withUnsafeBytes { (raw: UnsafeRawBufferPointer) in
+            var offset = 0
+            while offset < raw.count {
+                try Task.checkCancellation()
+                let chunkSize = min(1 << 19, raw.count - offset)
+                let chunk = UnsafeRawBufferPointer(rebasing: raw[offset..<offset + chunkSize])
+                crc = CRC32.checksum(chunk, seed: crc)
+                if let encoder {
+                    encoder.write(chunk)
+                    output.append(contentsOf: encoder.takeOutput())
+                }
+                offset += chunkSize
+                progress?(ZipProgress(
+                    completedBytes: UInt64(offset), totalBytes: totalBytes, currentPath: path
+                ))
+            }
+        }
+        guard let encoder else { return (crc, nil) }
+        encoder.finish()
+        output.append(contentsOf: encoder.takeOutput())
+        return (crc, output)
+    }
+
     @inline(__always)
     fileprivate static func matchLength(
         _ bytes: UnsafePointer<UInt8>, _ a: Int, _ b: Int, _ maxLength: Int

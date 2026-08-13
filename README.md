@@ -13,7 +13,7 @@ A pure-Swift ZIP library — read, write, compress, and extract ZIP archives wit
 - **Robust filename handling**: UTF-8 (flagged and unflagged), the Info-ZIP Unicode Path extra field, and CP437 fallback for legacy archives — plus an opt-in `legacyNameEncoding` for archives whose names use a system code page (Shift-JIS, Windows code pages, classic Mac OS encodings, ...)
 - **Metadata**: DOS timestamps and POSIX permissions round-trip through the archive
 - **Three compression levels**: `.fastest`, `.normal`, `.maximum`
-- **Async high-level API**: `zipItem`, `unzipItem`, `extractAll`, and `extract(_:to:)` are `async`, run off the caller's actor, report byte-level progress through a `@Sendable` callback, and stop on task cancellation
+- **Async API with progress and cancellation**: the high-level operations (`zipItem`, `unzipItem`, `extractAll`, `extract(_:to:)`) and async variants of the writers' `addFile` methods run off the caller's actor, report byte-level progress through a `@Sendable` callback, and stop on task cancellation
 - **Interoperable**: archives verify cleanly with Info-ZIP's `unzip -t`; archives from other tools (Info-ZIP, zlib streams) read correctly
 
 ### Security hardening
@@ -56,7 +56,15 @@ try writer.addDirectory(path: "backup")
 // Stream an existing file; only ~512 KiB is in memory at a time.
 try writer.addFile(path: "backup/huge-database.sqlite", contentsOf: databaseURL)
 
+// Async variants run off the caller's actor, report progress, and
+// honor task cancellation.
+try await writer.addFile(
+    path: "backup/huge-database.sqlite", contentsOf: databaseURL,
+    progress: { print($0.fraction ?? 0) }
+)
+
 // Push-style entry: generate contents on the fly, size unknown upfront.
+// (Also available with an async content closure.)
 try writer.addFile(path: "backup/export.csv") { stream in
     for row in rows {
         try stream.write(Data(row.csvLine.utf8))
@@ -165,7 +173,6 @@ Run the suite yourself with `swift test -c release` (the `Performance` suite pri
 - Appending to and updating existing archives
 - Optional symlink round-tripping behind an explicit opt-in flag
 - Zstandard / LZMA entry support
-- Async variants of the streaming writer APIs (`ZipWriter`/`ZipFileWriter`)
 - Multithreaded compression of independent entries
 - Extended timestamp (0x5455) and Unix extra fields for full-fidelity metadata
 - Linux support validation and CI
@@ -178,7 +185,7 @@ Run the suite yourself with `swift test -c release` (the `Performance` suite pri
 
 ## Testing
 
-92 test cases cover round trips across sizes, levels, and content types; streaming compression and extraction (chunked writes, cross-chunk matches, window sliding, partial-file cleanup); tricky filenames (emoji, CJK, combining accents, CP437, very long names); real-world fixtures created by Info-ZIP and zlib; verification of generated archives with the system `unzip`; and the full attack surface: traversal payloads, symlinks, ZIP bombs, lying size headers, flipped bytes, truncation, and garbage input.
+96 test cases cover round trips across sizes, levels, and content types; streaming compression and extraction (chunked writes, cross-chunk matches, window sliding, partial-file cleanup); tricky filenames (emoji, CJK, combining accents, CP437, very long names); real-world fixtures created by Info-ZIP and zlib; verification of generated archives with the system `unzip`; and the full attack surface: traversal payloads, symlinks, ZIP bombs, lying size headers, flipped bytes, truncation, and garbage input.
 
 ```sh
 swift test              # fast, debug

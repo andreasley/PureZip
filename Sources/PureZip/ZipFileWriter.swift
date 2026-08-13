@@ -119,9 +119,6 @@ public final class ZipFileWriter {
         guard addedPaths.insert(normalizedPath).inserted else {
             throw ZipError.duplicateEntry(normalizedPath)
         }
-        let nameBytes = [UInt8](normalizedPath.utf8)
-        guard nameBytes.count <= 0xFFFF else { throw ZipError.invalidPath(normalizedPath) }
-
         let crc = CRC32.checksum(data)
         var method: UInt16 = 0
         var payload: [UInt8]? = nil
@@ -132,6 +129,66 @@ public final class ZipFileWriter {
                 payload = compressed
             }
         }
+        try writeInMemoryEntry(
+            normalizedPath: normalizedPath, data: data, crc: crc, method: method,
+            payload: payload, modificationDate: modificationDate, permissions: permissions
+        )
+    }
+
+    /// Async variant of `addFile(path:data:...)`.
+    ///
+    /// Runs off the caller's actor, hashing and compressing in chunks so
+    /// `progress` sees intermediate snapshots and cancelling the surrounding
+    /// task stops the work with `CancellationError`. A cancelled call leaves
+    /// the writer unchanged and usable; the store-vs-DEFLATE fallback matches
+    /// the synchronous variant.
+    @concurrent
+    public func addFile(
+        path: String,
+        data: Data,
+        compress: Bool = true,
+        modificationDate: Date = Date(),
+        permissions: UInt16 = 0o644,
+        progress: ZipProgressHandler? = nil
+    ) async throws {
+        try requireReady()
+        let normalizedPath = try ZipPath.normalizedArchivePath(path, isDirectory: false)
+        guard !addedPaths.contains(normalizedPath) else {
+            throw ZipError.duplicateEntry(normalizedPath)
+        }
+        let (crc, compressed) = try Deflate.checksumAndCompress(
+            data, level: level, compress: compress, path: normalizedPath, progress: progress
+        )
+        var method: UInt16 = 0
+        var payload: [UInt8]? = nil
+        if let compressed, compressed.count < data.count {
+            method = 8
+            payload = compressed
+        }
+        addedPaths.insert(normalizedPath)
+        try writeInMemoryEntry(
+            normalizedPath: normalizedPath, data: data, crc: crc, method: method,
+            payload: payload, modificationDate: modificationDate, permissions: permissions
+        )
+        progress?(ZipProgress(
+            completedBytes: UInt64(data.count), totalBytes: UInt64(data.count),
+            currentPath: normalizedPath
+        ))
+    }
+
+    /// Writes the header, payload, and central-directory record for an entry
+    /// whose contents (and compressed form, if any) are already in memory.
+    private func writeInMemoryEntry(
+        normalizedPath: String,
+        data: Data,
+        crc: UInt32,
+        method: UInt16,
+        payload: [UInt8]?,
+        modificationDate: Date,
+        permissions: UInt16
+    ) throws {
+        let nameBytes = [UInt8](normalizedPath.utf8)
+        guard nameBytes.count <= 0xFFFF else { throw ZipError.invalidPath(normalizedPath) }
         let compressedSize = UInt64(payload?.count ?? data.count)
         let uncompressedSize = UInt64(data.count)
         let flags: UInt16 = normalizedPath.allSatisfy(\.isASCII) ? 0 : 0x0800
@@ -188,6 +245,79 @@ public final class ZipFileWriter {
         permissions: UInt16 = 0o644,
         content: (ZipEntryStream) throws -> Void
     ) throws {
+        let (entry, stream) = try beginStreamedEntry(
+            path: path, expectedSize: expectedSize, compress: compress,
+            modificationDate: modificationDate, permissions: permissions,
+            progress: nil, honorsCancellation: false
+        )
+        do {
+            try content(stream)
+        } catch {
+            state = .failed
+            throw error
+        }
+        try endStreamedEntry(entry, stream: stream)
+    }
+
+    /// Async variant of `addFile(path:expectedSize:...content:)`.
+    ///
+    /// Runs off the caller's actor and accepts an `async` content closure.
+    /// Every `stream.write` reports a progress snapshot (with `expectedSize`
+    /// as the total, when given) and checks for task cancellation. If the
+    /// entry fails or is cancelled mid-write the writer becomes unusable,
+    /// like any other streaming failure.
+    @concurrent
+    public func addFile(
+        path: String,
+        expectedSize: UInt64? = nil,
+        compress: Bool = true,
+        modificationDate: Date = Date(),
+        permissions: UInt16 = 0o644,
+        progress: ZipProgressHandler? = nil,
+        content: (ZipEntryStream) async throws -> Void
+    ) async throws {
+        let (entry, stream) = try beginStreamedEntry(
+            path: path, expectedSize: expectedSize, compress: compress,
+            modificationDate: modificationDate, permissions: permissions,
+            progress: progress, honorsCancellation: true
+        )
+        do {
+            try await content(stream)
+        } catch {
+            state = .failed
+            throw error
+        }
+        let totals = try endStreamedEntry(entry, stream: stream)
+        progress?(ZipProgress(
+            completedBytes: totals.uncompressed, totalBytes: totals.uncompressed,
+            currentPath: entry.normalizedPath
+        ))
+    }
+
+    /// Everything both streamed-entry variants share up to running the
+    /// caller's content closure: validation, the placeholder local header,
+    /// and the configured entry stream.
+    private struct StreamedEntry {
+        let normalizedPath: String
+        let nameBytes: [UInt8]
+        let flags: UInt16
+        let method: UInt16
+        let dosTime: UInt16
+        let dosDate: UInt16
+        let externalAttributes: UInt32
+        let headerOffset: UInt64
+        let reserveZip64: Bool
+    }
+
+    private func beginStreamedEntry(
+        path: String,
+        expectedSize: UInt64?,
+        compress: Bool,
+        modificationDate: Date,
+        permissions: UInt16,
+        progress: ZipProgressHandler?,
+        honorsCancellation: Bool
+    ) throws -> (entry: StreamedEntry, stream: ZipEntryStream) {
         try requireReady()
         let normalizedPath = try ZipPath.normalizedArchivePath(path, isDirectory: false)
         guard addedPaths.insert(normalizedPath).inserted else {
@@ -221,29 +351,50 @@ public final class ZipFileWriter {
         )
 
         state = .entryOpen
-        let totals: (crc: UInt32, uncompressed: UInt64, compressed: UInt64)
         do {
             try writeArchiveBytes(header)
-            let stream = ZipEntryStream(
-                writer: self,
-                encoder: compress ? DeflateEncoder(level: level) : nil
-            )
-            try content(stream)
+        } catch {
+            state = .failed
+            throw error
+        }
+        let stream = ZipEntryStream(
+            writer: self,
+            encoder: compress ? DeflateEncoder(level: level) : nil,
+            progress: progress,
+            expectedTotalBytes: expectedSize,
+            progressPath: normalizedPath,
+            honorsCancellation: honorsCancellation
+        )
+        let entry = StreamedEntry(
+            normalizedPath: normalizedPath, nameBytes: nameBytes, flags: flags,
+            method: method, dosTime: dosTime, dosDate: dosDate,
+            externalAttributes: externalAttributes,
+            headerOffset: headerOffset, reserveZip64: reserveZip64
+        )
+        return (entry, stream)
+    }
+
+    @discardableResult
+    private func endStreamedEntry(
+        _ entry: StreamedEntry, stream: ZipEntryStream
+    ) throws -> (crc: UInt32, uncompressed: UInt64, compressed: UInt64) {
+        let totals: (crc: UInt32, uncompressed: UInt64, compressed: UInt64)
+        do {
             totals = try stream.finish()
 
-            if !reserveZip64 {
+            if !entry.reserveZip64 {
                 guard totals.compressed < 0xFFFF_FFFF, totals.uncompressed < 0xFFFF_FFFF else {
                     throw ZipError.limitExceeded(
-                        "entry '\(normalizedPath)' grew past 4 GiB but was expected to be smaller"
+                        "entry '\(entry.normalizedPath)' grew past 4 GiB but was expected to be smaller"
                     )
                 }
             }
 
             // Patch CRC-32 and sizes into the local header now that they are known.
-            try handle.seek(toOffset: headerOffset + 14)
+            try handle.seek(toOffset: entry.headerOffset + 14)
             var patch: [UInt8] = []
             patch.appendLE32(totals.crc)
-            if reserveZip64 {
+            if entry.reserveZip64 {
                 patch.appendLE32(0xFFFF_FFFF)
                 patch.appendLE32(0xFFFF_FFFF)
             } else {
@@ -251,8 +402,8 @@ public final class ZipFileWriter {
                 patch.appendLE32(UInt32(totals.uncompressed))
             }
             try handle.write(contentsOf: Data(patch))
-            if reserveZip64 {
-                try handle.seek(toOffset: headerOffset + 30 + UInt64(nameBytes.count) + 4)
+            if entry.reserveZip64 {
+                try handle.seek(toOffset: entry.headerOffset + 30 + UInt64(entry.nameBytes.count) + 4)
                 var sizes: [UInt8] = []
                 sizes.appendLE64(totals.uncompressed)
                 sizes.appendLE64(totals.compressed)
@@ -266,13 +417,14 @@ public final class ZipFileWriter {
 
         records.append(
             ZipEntryRecord(
-                nameBytes: nameBytes, flags: flags, method: method,
-                dosTime: dosTime, dosDate: dosDate, crc32: totals.crc,
+                nameBytes: entry.nameBytes, flags: entry.flags, method: entry.method,
+                dosTime: entry.dosTime, dosDate: entry.dosDate, crc32: totals.crc,
                 compressedSize: totals.compressed, uncompressedSize: totals.uncompressed,
-                localHeaderOffset: headerOffset, externalAttributes: externalAttributes
+                localHeaderOffset: entry.headerOffset, externalAttributes: entry.externalAttributes
             )
         )
         state = .ready
+        return totals
     }
 
     /// Adds a file entry by streaming an existing file's contents from disk.
@@ -299,6 +451,44 @@ public final class ZipFileWriter {
             compress: compress,
             modificationDate: date,
             permissions: filePermissions
+        ) { stream in
+            while let chunk = try input.read(upToCount: 1 << 19), !chunk.isEmpty {
+                try stream.write(chunk)
+            }
+        }
+    }
+
+    /// Async variant of `addFile(path:contentsOf:...)`.
+    ///
+    /// Runs off the caller's actor, streaming the file in ~512 KiB chunks;
+    /// each chunk reports a progress snapshot (total = the source file's
+    /// size) and checks for task cancellation. If the entry fails or is
+    /// cancelled mid-write the writer becomes unusable, like any other
+    /// streaming failure.
+    @concurrent
+    public func addFile(
+        path: String,
+        contentsOf fileURL: URL,
+        compress: Bool = true,
+        modificationDate: Date? = nil,
+        permissions: UInt16? = nil,
+        progress: ZipProgressHandler? = nil
+    ) async throws {
+        let attributes = try? FileManager.default.attributesOfItem(atPath: fileURL.path)
+        let size = (attributes?[.size] as? NSNumber)?.uint64Value
+        let date = modificationDate ?? (attributes?[.modificationDate] as? Date) ?? Date()
+        let filePermissions = permissions
+            ?? (attributes?[.posixPermissions] as? NSNumber).map { UInt16(truncatingIfNeeded: $0.uint16Value) }
+            ?? 0o644
+        let input = try FileHandle(forReadingFrom: fileURL)
+        defer { try? input.close() }
+        try await addFile(
+            path: path,
+            expectedSize: size,
+            compress: compress,
+            modificationDate: date,
+            permissions: filePermissions,
+            progress: progress
         ) { stream in
             while let chunk = try input.read(upToCount: 1 << 19), !chunk.isEmpty {
                 try stream.write(chunk)
@@ -388,14 +578,31 @@ public final class ZipFileWriter {
 public final class ZipEntryStream {
     private let writer: ZipFileWriter
     private let encoder: DeflateEncoder?
+    // Set for entries opened through the async writer APIs: progress is
+    // reported and task cancellation is checked on every write.
+    private let progress: ZipProgressHandler?
+    private let expectedTotalBytes: UInt64?
+    private let progressPath: String?
+    private let honorsCancellation: Bool
     private var crc: UInt32 = 0
     private var uncompressed: UInt64 = 0
     private var compressed: UInt64 = 0
     private var isFinished = false
 
-    fileprivate init(writer: ZipFileWriter, encoder: DeflateEncoder?) {
+    fileprivate init(
+        writer: ZipFileWriter,
+        encoder: DeflateEncoder?,
+        progress: ZipProgressHandler? = nil,
+        expectedTotalBytes: UInt64? = nil,
+        progressPath: String? = nil,
+        honorsCancellation: Bool = false
+    ) {
         self.writer = writer
         self.encoder = encoder
+        self.progress = progress
+        self.expectedTotalBytes = expectedTotalBytes
+        self.progressPath = progressPath
+        self.honorsCancellation = honorsCancellation
     }
 
     /// Appends a chunk of the entry's contents.
@@ -408,6 +615,7 @@ public final class ZipEntryStream {
         guard !isFinished else {
             throw ZipError.invalidState("the entry stream was already closed")
         }
+        if honorsCancellation { try Task.checkCancellation() }
         guard !buffer.isEmpty, let base = buffer.baseAddress else { return }
         crc = CRC32.checksum(buffer, seed: crc)
         uncompressed += UInt64(buffer.count)
@@ -418,6 +626,9 @@ public final class ZipEntryStream {
             try writer.writeEntryData(Data(bytes: base, count: buffer.count))
             compressed += UInt64(buffer.count)
         }
+        progress?(ZipProgress(
+            completedBytes: uncompressed, totalBytes: expectedTotalBytes, currentPath: progressPath
+        ))
     }
 
     private func drainEncoder() throws {

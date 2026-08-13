@@ -97,7 +97,7 @@ struct StreamingTests {
         try await withTemporaryDirectory { directory in
             let payload = mixedData(count: 2_000_000, seed: 66)
             let writer = ZipWriter()
-            try writer.addFile(path: "data.bin", data: payload, permissions: 0o600)
+            try await writer.addFile(path: "data.bin", data: payload, permissions: 0o600)
             let archive = try ZipArchive(data: writer.finalize())
             let entry = try #require(archive["data.bin"])
 
@@ -193,6 +193,124 @@ struct StreamingTests {
             }
         }
         #expect(streamed == original)
+    }
+
+    @Test func asyncFileWriterReportsProgressAndRoundTrips() async throws {
+        try await withTemporaryDirectory { directory in
+            let bigFile = directory.appendingPathComponent("big.bin")
+            let bigData = mixedData(count: 2_000_000, seed: 301)
+            try bigData.write(to: bigFile)
+
+            let archiveURL = directory.appendingPathComponent("async.zip")
+            let writer = try ZipFileWriter(url: archiveURL)
+
+            // Streamed from disk: per-chunk progress with the file size as total.
+            let fileLog = ProgressLog()
+            try await writer.addFile(path: "big.bin", contentsOf: bigFile) { fileLog.append($0) }
+            let fileSnapshots = fileLog.snapshots
+            #expect(fileSnapshots.count > 1, "multi-chunk input should report more than once")
+            #expect(fileSnapshots.allSatisfy { $0.totalBytes == UInt64(bigData.count) })
+            let fileCompleted = fileSnapshots.map(\.completedBytes)
+            #expect(fileCompleted == fileCompleted.sorted(), "progress must be monotonic")
+            #expect(fileSnapshots.last?.fraction == 1)
+
+            // In-memory entry: the store fallback must survive the async path.
+            let noise = randomData(count: 800_000, seed: 302)
+            let dataLog = ProgressLog()
+            try await writer.addFile(path: "noise.bin", data: noise) { dataLog.append($0) }
+            #expect(dataLog.snapshots.last?.completedBytes == UInt64(noise.count))
+
+            // Push-style entry with an async content closure.
+            let chunks = (0..<5).map { mixedData(count: 100_000, seed: UInt64(400 + $0)) }
+            let pushed = chunks.reduce(Data(), +)
+            let pushLog = ProgressLog()
+            try await writer.addFile(
+                path: "pushed.bin",
+                expectedSize: UInt64(pushed.count),
+                progress: { pushLog.append($0) }
+            ) { stream in
+                for chunk in chunks {
+                    try stream.write(chunk)
+                }
+            }
+            #expect(pushLog.snapshots.last?.completedBytes == UInt64(pushed.count))
+            #expect(pushLog.snapshots.last?.fraction == 1)
+
+            try writer.finalize()
+
+            let archive = try ZipArchive(url: archiveURL)
+            #expect(try archive.extractData(at: "big.bin") == bigData)
+            #expect(try archive.extractData(at: "noise.bin") == noise)
+            #expect(try #require(archive["noise.bin"]).compressionMethod == .store,
+                    "incompressible data must still fall back to Store")
+            #expect(try archive.extractData(at: "pushed.bin") == pushed)
+        }
+    }
+
+    @Test func asyncZipWriterReportsProgressAndRoundTrips() async throws {
+        let writer = ZipWriter()
+        let payload = mixedData(count: 1_500_000, seed: 303)
+        let log = ProgressLog()
+        try await writer.addFile(path: "data.bin", data: payload) { log.append($0) }
+        #expect(log.snapshots.count > 1)
+        #expect(log.snapshots.last?.fraction == 1)
+
+        let archive = try ZipArchive(data: writer.finalize())
+        #expect(try archive.extractData(at: "data.bin") == payload)
+    }
+
+    @Test func cancelledStreamedEntryFailsWriter() async throws {
+        try await withTemporaryDirectory { directory in
+            let bigFile = directory.appendingPathComponent("big.bin")
+            try mixedData(count: 3_000_000, seed: 304).write(to: bigFile)
+            let archiveURL = directory.appendingPathComponent("cancelled.zip")
+
+            // Runs in a child task so cancelling doesn't poison the test's own task.
+            let outcome = await Task { () -> String in
+                guard let writer = try? ZipFileWriter(url: archiveURL) else { return "setup failed" }
+                do {
+                    // Cancel ourselves after the first progress report; the
+                    // next chunk's cancellation check must throw.
+                    try await writer.addFile(path: "big.bin", contentsOf: bigFile) { _ in
+                        withUnsafeCurrentTask { $0?.cancel() }
+                    }
+                    return "not cancelled"
+                } catch is CancellationError {
+                    // A cancelled entry leaves a half-written stream, so the
+                    // writer must refuse further use.
+                    do {
+                        try writer.finalize()
+                        return "writer still usable"
+                    } catch is ZipError {
+                        return "cancelled and unusable"
+                    } catch {
+                        return "unexpected error"
+                    }
+                } catch {
+                    return "unexpected error"
+                }
+            }.value
+            #expect(outcome == "cancelled and unusable")
+        }
+    }
+
+    @Test func cancelledInMemoryEntryLeavesWriterUnchanged() async throws {
+        let outcome = await Task { () -> String in
+            let writer = ZipWriter()
+            let payload = mixedData(count: 3_000_000, seed: 305)
+            do {
+                try await writer.addFile(path: "big.bin", data: payload) { _ in
+                    withUnsafeCurrentTask { $0?.cancel() }
+                }
+                return "not cancelled"
+            } catch is CancellationError {
+                // Cancellation happens before anything is written.
+                return "cancelled, \(writer.count) bytes written"
+            } catch {
+                return "unexpected error"
+            }
+        }.value
+        #expect(outcome == "cancelled, 0 bytes written")
     }
 
     @Test func writerBecomesUnusableAfterEntryError() throws {

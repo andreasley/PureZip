@@ -69,6 +69,53 @@ public final class ZipWriter {
         )
     }
 
+    /// Async variant of `addFile(path:data:...)`.
+    ///
+    /// Runs off the caller's actor, hashing and compressing in chunks so
+    /// `progress` sees intermediate snapshots and cancelling the surrounding
+    /// task stops the work with `CancellationError`. A cancelled call leaves
+    /// the writer unchanged and usable; the store-vs-DEFLATE fallback matches
+    /// the synchronous variant.
+    @concurrent
+    public func addFile(
+        path: String,
+        data: Data,
+        compress: Bool = true,
+        modificationDate: Date = Date(),
+        permissions: UInt16 = 0o644,
+        progress: ZipProgressHandler? = nil
+    ) async throws {
+        let normalizedPath = try ZipPath.normalizedArchivePath(path, isDirectory: false)
+        guard !addedPaths.contains(normalizedPath) else {
+            throw ZipError.duplicateEntry(normalizedPath)
+        }
+        let (crc, compressed) = try Deflate.checksumAndCompress(
+            data, level: level, compress: compress, path: normalizedPath, progress: progress
+        )
+        var method: UInt16 = 0
+        var payload: [UInt8]? = nil
+        if let compressed, compressed.count < data.count {
+            method = 8
+            payload = compressed
+        }
+        addedPaths.insert(normalizedPath)
+        let externalAttributes = (UInt32(permissions & 0o7777) | 0o100000) << 16
+        try addEntry(
+            normalizedPath: normalizedPath,
+            method: method,
+            crc32: crc,
+            uncompressedSize: UInt64(data.count),
+            payload: payload,
+            storedData: payload == nil ? data : nil,
+            modificationDate: modificationDate,
+            externalAttributes: externalAttributes
+        )
+        progress?(ZipProgress(
+            completedBytes: UInt64(data.count), totalBytes: UInt64(data.count),
+            currentPath: normalizedPath
+        ))
+    }
+
     /// Adds a directory entry.
     public func addDirectory(
         path: String,
